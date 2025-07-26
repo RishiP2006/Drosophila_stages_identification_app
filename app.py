@@ -1,133 +1,122 @@
 import streamlit as st
 st.set_page_config(layout="centered")
 
-# Core imports
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 from huggingface_hub import hf_hub_download
 from tensorflow.keras.models import load_model as lm
-# Preprocess functions
-from tensorflow.keras.applications.convnext import preprocess_input as cx_preprocess
 from tensorflow.keras.applications.inception_v3 import preprocess_input as iv3_preprocess
+from tensorflow.keras.applications.convnext import preprocess_input as cx_preprocess
 from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
 
-# ─── Configuration ─────────────────────
+# ─── Config ─────────────────────────────
 HF_REPO_ID = "RishiPTrial/stage_modelv2"
 MODELS_INFO = {
-    "ConvNeXt": {"filename": "best_convnext_model_IIT.keras", "preprocess": cx_preprocess, "size": 224},
     "InceptionV3": {"filename": "drosophila_inceptionv3_classifier.h5", "preprocess": iv3_preprocess, "size": 299},
+    "ConvNeXt": {"filename": "best_convnext_model_IIT.keras", "preprocess": cx_preprocess, "size": 224},
     "ResNet50": {"filename": "drosophila_stage_resnet50_finetuned_IIT.keras", "preprocess": resnet_preprocess, "size": 224},
 }
-CLASS_NAMES = [
+STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
-    "white pupa", "brown pupa", "eye pupa", "black pupa",
+    "white pupa", "brown pupa", "eye pupa", "black pupa"
 ]
 
-# ─── Load Models ───────────────────────
+# ─── Load Models ─────────────────────────
 @st.cache_resource
 def load_models():
     models = {}
     for name, info in MODELS_INFO.items():
-        model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=info["filename"])
-        custom_objects = {"preprocess_input": info["preprocess"]}
-        models[name] = (
-            lm(model_path, compile=False, custom_objects=custom_objects),
-            info["preprocess"],
-            info["size"],
-        )
+        path = hf_hub_download(repo_id=HF_REPO_ID, filename=info["filename"])
+        model = lm(path, compile=False, custom_objects={"preprocess_input": info["preprocess"]})
+        models[name] = (model, info["preprocess"], info["size"])
     return models
 
 models = load_models()
 
-# ─── Prediction Helpers ────────────────
-def preprocess_image(pil_img: Image.Image, size: int, preprocess_fn):
-    img = pil_img.resize((size, size)).convert("RGB")
-    arr = np.asarray(img, dtype=np.float32)
+# ─── Prediction Utilities ────────────────
+def preprocess_image(pil: Image.Image, size: int, preprocess_fn):
+    pil = pil.resize((size, size)).convert("RGB")
+    arr = np.asarray(pil, np.float32)
     return preprocess_fn(arr)
 
-
-def classify_single(pil_img: Image.Image, model, preprocess_fn, size: int):
-    arr = preprocess_image(pil_img, size, preprocess_fn)
-    preds = model.predict(np.expand_dims(arr, axis=0), verbose=0)[0]
+def classify_single(pil: Image.Image, model, preprocess_fn, size: int):
+    arr = preprocess_image(pil, size, preprocess_fn)
+    preds = model.predict(arr[np.newaxis], verbose=0)[0]
     idx = int(np.argmax(preds))
-    return CLASS_NAMES[idx], float(preds[idx])
+    return STAGE_LABELS[idx], float(preds[idx])
 
+def classify_ensemble(pil: Image.Image, models_dict):
+    votes = []
+    confidences = {}
+    for name, (model, pre_fn, size) in models_dict.items():
+        label, conf = classify_single(pil, model, pre_fn, size)
+        votes.append(label)
+        confidences.setdefault(label, []).append(conf)
 
-def classify_ensemble(pil_img: Image.Image, models_dict):
-    votes, confs = [], {}
-    for m, fn, sz in models_dict.values():
-        lbl, cf = classify_single(pil_img, m, fn, sz)
-        votes.append(lbl)
-        confs.setdefault(lbl, []).append(cf)
     from collections import Counter
-    top = Counter(votes).most_common()
-    if len(top) > 1 and top[0][1] == top[1][1]:
-        # tie: choose label with highest avg confidence
-        avg_conf = {lbl: np.mean(lst) for lbl, lst in confs.items()}
-        choice = max(avg_conf, key=avg_conf.get)
+    count = Counter(votes)
+    top_votes = count.most_common()
+    if len(top_votes) > 1 and top_votes[0][1] == top_votes[1][1]:
+        # tie — choose label with highest avg confidence
+        avg_conf = {lbl: np.mean(confs) for lbl, confs in confidences.items()}
+        chosen = max(avg_conf, key=avg_conf.get)
     else:
-        choice = top[0][0]
-    return choice, max(confs[choice])
+        chosen = top_votes[0][0]
 
-# ─── Streamlit UI ──────────────────────
-st.title("Drosophila Stage Detection")
-mode = st.radio("Select Mode:", ["Single Model", "Ensemble"])
+    return chosen, max(confidences[chosen])
 
-single_cfg = None
+# ─── UI ──────────────────────────────────
+st.title("🧬 Live Drosophila Stage Detection")
+mode = st.radio("Choose Mode", ["Single Model", "Ensemble"])
+
 if mode == "Single Model":
-    choice = st.selectbox("Choose a model:", list(models.keys()))
-    single_cfg = models[choice]
+    selected_model = st.selectbox("Choose a model", list(models.keys()))
+    single_model_cfg = models[selected_model]
 else:
-    st.info("Using ensemble of all three models")
+    single_model_cfg = None
+    st.info("Using all models in ensemble")
 
-# ─── Static Image Prediction ───────────
-uploaded_file = st.file_uploader("Upload image for prediction", type=["png", "jpg", "jpeg"])
-if uploaded_file is not None:
-    img = Image.open(uploaded_file)
-    if mode == "Single Model" and single_cfg:
-        label, conf = classify_single(img, *single_cfg)
-    else:
-        label, conf = classify_ensemble(img, models)
-    st.image(img, caption=f"{label} ({conf:.2f})")
-    st.write(f"**Prediction:** {label} | **Confidence:** {conf:.2f}")
+# ─── Video Processor ─────────────────────
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.mode = mode
+        self.single_model_cfg = single_model_cfg
+        self.models = models
 
-st.markdown("---")
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="rgb24")
+        pil = Image.fromarray(img)
 
-# ─── Live Video Prediction ─────────────
-st.subheader("Live Camera Prediction")
+        if self.mode == "Single Model":
+            label, conf = classify_single(pil, *self.single_model_cfg)
+        else:
+            label, conf = classify_ensemble(pil, self.models)
 
-if mode == "Single Model" and single_cfg is None:
-    st.warning("Please select a model for live detection.")
-else:
-    # Define processor class inside this block so it captures single_cfg and mode
-    class LiveProcessor(VideoProcessorBase):
-        def __init__(self):
-            self.mode = mode
-            self.single_cfg = single_cfg
-            self.models = models
+        # Draw prediction
+        draw = ImageDraw.Draw(pil)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        text = f"{label} ({conf:.0%})"
+        text_size = draw.textbbox((0, 0), text, font=font)
+        padding = 6
+        bg_rect = [
+            text_size[0] - padding,
+            text_size[1] - padding,
+            text_size[2] + padding,
+            text_size[3] + padding
+        ]
+        draw.rectangle(bg_rect, fill="black")
+        draw.text((0, 0), text, font=font, fill="lime")
+        return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="rgb24")
-            pil = Image.fromarray(img)
-            if self.mode == "Single Model":
-                lbl, cf = classify_single(pil, *self.single_cfg)
-            else:
-                lbl, cf = classify_ensemble(pil, self.models)
-            # draw
-            draw = ImageDraw.Draw(pil)
-            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 24)
-            text = f"{lbl} ({cf:.0%})"
-            w = draw.textlength(text, font)
-            draw.rectangle([0, 0, w + 8, 32], fill="black")
-            draw.text((4, 4), text, font=font, fill="lime")
-            return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
+# ─── Live Camera ─────────────────────────
+st.subheader("📸 Live Camera Detection")
 
-    webrtc_streamer(
-        key="live_camera",
-        mode=WebRtcMode.SENDRECV,
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=LiveProcessor,
-        async_processing=True,
-    )
+webrtc_streamer(
+    key="live-drosophila",
+    mode=WebRtcMode.SENDRECV,
+    media_stream_constraints={"video": True, "audio": False},
+    video_processor_factory=VideoProcessor,
+    async_processing=True,
+)

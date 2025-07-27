@@ -2,7 +2,7 @@ import streamlit as st
 st.set_page_config(layout="centered")
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 from huggingface_hub import hf_hub_download
@@ -30,7 +30,6 @@ def load_models():
     for name, info in MODELS_INFO.items():
         try:
             path = hf_hub_download(repo_id=HF_REPO_ID, filename=info["filename"])
-            # Add preprocess function as a custom object (needed for .keras files)
             model = lm(path, compile=False, custom_objects={"preprocess_input": info["preprocess"]})
             models[name] = (model, info["preprocess"], info["size"])
         except Exception as e:
@@ -54,7 +53,7 @@ def classify_single(pil: Image.Image, model, preprocess_fn, size: int):
 def classify_ensemble(pil: Image.Image, models_dict):
     votes = []
     confidences = {}
-    for name, (model, pre_fn, size) in models_dict.items():
+    for _, (model, pre_fn, size) in models_dict.items():
         label, conf = classify_single(pil, model, pre_fn, size)
         votes.append(label)
         confidences.setdefault(label, []).append(conf)
@@ -63,7 +62,6 @@ def classify_ensemble(pil: Image.Image, models_dict):
     count = Counter(votes)
     top_votes = count.most_common()
     if len(top_votes) > 1 and top_votes[0][1] == top_votes[1][1]:
-        # tie — choose label with highest avg confidence
         avg_conf = {lbl: np.mean(confs) for lbl, confs in confidences.items()}
         chosen = max(avg_conf, key=avg_conf.get)
     else:
@@ -82,8 +80,8 @@ else:
     single_model_cfg = None
     st.info("Using all models in ensemble")
 
-# ─── Video Processor ─────────────────────
-class VideoProcessor(VideoProcessorBase):
+# ─── Fast Video Processor ────────────────
+class FastProcessor(VideoProcessorBase):
     def __init__(self):
         self.mode = mode
         self.single_model_cfg = single_model_cfg
@@ -98,29 +96,22 @@ class VideoProcessor(VideoProcessorBase):
         else:
             label, conf = classify_ensemble(pil, self.models)
 
-        # Draw prediction
+        # Fast drawing (no font load)
         draw = ImageDraw.Draw(pil)
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
-        text = f"{label} ({conf:.0%})"
-        text_size = draw.textbbox((0, 0), text, font=font)
-        padding = 6
-        bg_rect = [
-            text_size[0] - padding,
-            text_size[1] - padding,
-            text_size[2] + padding,
-            text_size[3] + padding
-        ]
-        draw.rectangle(bg_rect, fill="black")
-        draw.text((0, 0), text, font=font, fill="lime")
+        draw.text((10, 10), f"{label} ({conf:.0%})", fill="lime")
+
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
 # ─── Live Camera ─────────────────────────
 st.subheader("📸 Live Camera Detection")
 
 webrtc_streamer(
-    key="live-drosophila",
+    key="fast-live-drosophila",
     mode=WebRtcMode.SENDRECV,
-    media_stream_constraints={"video": True, "audio": False},
-    video_processor_factory=VideoProcessor,
+    media_stream_constraints={
+        "video": {"width": {"ideal": 320}, "height": {"ideal": 240}},
+        "audio": False
+    },
+    video_processor_factory=FastProcessor,
     async_processing=True,
 )

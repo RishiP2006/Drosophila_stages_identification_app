@@ -1,117 +1,156 @@
+import sys
 import streamlit as st
-st.set_page_config(layout="centered")
-
 import numpy as np
 from PIL import Image, ImageDraw
+import re
+from huggingface_hub import hf_hub_download, HfApi
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
-from huggingface_hub import hf_hub_download
-from tensorflow.keras.models import load_model as lm
-from tensorflow.keras.applications.inception_v3 import preprocess_input as iv3_preprocess
-from tensorflow.keras.applications.convnext import preprocess_input as cx_preprocess
-from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
 
-# ─── Config ─────────────────────────────
+st.set_page_config(page_title="Drosophila Stage Detection", layout="centered")
+st.title("🧬 Drosophila Stage Detection")
+st.write("Select a model and upload an image or use live camera.")
+
 HF_REPO_ID = "RishiPTrial/stage_modelv2"
-MODELS_INFO = {
-    "InceptionV3": {"filename": "drosophila_inceptionv3_classifier.h5", "preprocess": iv3_preprocess, "size": 299},
-    "ConvNeXt": {"filename": "best_convnext_model_IIT.keras", "preprocess": cx_preprocess, "size": 224},
-    "ResNet50": {"filename": "drosophila_stage_resnet50_finetuned_IIT.keras", "preprocess": resnet_preprocess, "size": 224},
-}
+
+@st.cache_data(show_spinner=False)
+def list_hf_models():
+    api = HfApi()
+    try:
+        files = api.list_repo_files(repo_id=HF_REPO_ID)
+        return [f for f in files if f.lower().endswith(".h5") and not f.startswith(".")]
+    except Exception:
+        return []
+
+@st.cache_data(show_spinner=False)
+def build_models_info():
+    files = list_hf_models()
+    info = {}
+    for fname in files:
+        input_size = 224
+        if "inceptionv3" in fname.lower():
+            input_size = 299
+        info[fname] = {"type": "classification", "framework": "keras", "input_size": input_size}
+    return info
+
+MODELS_INFO = build_models_info()
+if not MODELS_INFO:
+    st.error(f"No model files found in HF repo {HF_REPO_ID}")
+
+@st.cache_resource(show_spinner=False)
+def load_model_from_hf(name, info):
+    try:
+        path = hf_hub_download(repo_id=HF_REPO_ID, filename=name)
+    except Exception as e:
+        st.error(f"Error downloading {name}: {e}")
+        return None
+
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.applications.inception_v3 import preprocess_input as iv3
+        from tensorflow.keras.applications.convnext import preprocess_input as cx
+        from tensorflow.keras.applications.resnet50 import preprocess_input as res
+
+        custom_objects = {
+            "preprocess_input": iv3,
+            "iv3_preprocess": iv3,
+            "cx_preprocess": cx,
+            "resnet_preprocess": res,
+        }
+        model = tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
+        return model
+    except Exception as e:
+        st.error(f"Failed loading Keras model {name}: {e}")
+        return None
+
+def preprocess_image_pil(pil_img: Image.Image, size: int):
+    arr = pil_img.resize((size, size))
+    arr = np.asarray(arr).astype(np.float32) / 255.0
+    return arr
+
+def classify(model, img_array: np.ndarray):
+    x = np.expand_dims(img_array, axis=0)
+    try:
+        import tensorflow as tf
+        if isinstance(model, tf.keras.Model):
+            return model.predict(x)
+    except Exception:
+        pass
+    st.error("Unknown model type for prediction.")
+    return None
+
 STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
     "white pupa", "brown pupa", "eye pupa", "black pupa"
 ]
 
-# ─── Load Models ─────────────────────────
-@st.cache_resource
-def load_models():
-    models = {}
-    for name, info in MODELS_INFO.items():
-        try:
-            path = hf_hub_download(repo_id=HF_REPO_ID, filename=info["filename"])
-            model = lm(path, compile=False, custom_objects={"preprocess_input": info["preprocess"]})
-            models[name] = (model, info["preprocess"], info["size"])
-        except Exception as e:
-            st.warning(f"Failed to load model {name}: {e}")
-    return models
+def interpret_stage(preds):
+    if preds is None:
+        return None, None
+    arr = np.asarray(preds)
+    if arr.ndim == 2 and arr.shape[1] == len(STAGE_LABELS):
+        idx = int(np.argmax(arr))
+        return STAGE_LABELS[idx], float(arr[0][idx])
+    st.warning(f"Unexpected prediction shape: {arr.shape}")
+    return None, None
 
-models = load_models()
-
-# ─── Prediction Utilities ────────────────
-def preprocess_image(pil: Image.Image, size: int, preprocess_fn):
-    pil = pil.resize((size, size)).convert("RGB")
-    arr = np.asarray(pil, np.float32)
-    return preprocess_fn(arr)
-
-def classify_single(pil: Image.Image, model, preprocess_fn, size: int):
-    arr = preprocess_image(pil, size, preprocess_fn)
-    preds = model.predict(arr[np.newaxis], verbose=0)[0]
-    idx = int(np.argmax(preds))
-    return STAGE_LABELS[idx], float(preds[idx])
-
-def classify_ensemble(pil: Image.Image, models_dict):
-    votes = []
-    confidences = {}
-    for _, (model, pre_fn, size) in models_dict.items():
-        label, conf = classify_single(pil, model, pre_fn, size)
-        votes.append(label)
-        confidences.setdefault(label, []).append(conf)
-
-    from collections import Counter
-    count = Counter(votes)
-    top_votes = count.most_common()
-    if len(top_votes) > 1 and top_votes[0][1] == top_votes[1][1]:
-        avg_conf = {lbl: np.mean(confs) for lbl, confs in confidences.items()}
-        chosen = max(avg_conf, key=avg_conf.get)
-    else:
-        chosen = top_votes[0][0]
-
-    return chosen, max(confidences[chosen])
-
-# ─── UI ──────────────────────────────────
-st.title("🧬 Live Drosophila Stage Detection")
-mode = st.radio("Choose Mode", ["Single Model", "Ensemble"])
-
-if mode == "Single Model":
-    selected_model = st.selectbox("Choose a model", list(models.keys()))
-    single_model_cfg = models[selected_model]
-else:
-    single_model_cfg = None
-    st.info("Using all models in ensemble")
-
-# ─── Fast Video Processor ────────────────
-class FastProcessor(VideoProcessorBase):
+class StageDetectionProcessor(VideoProcessorBase):
     def __init__(self):
-        self.mode = mode
-        self.single_model_cfg = single_model_cfg
-        self.models = models
+        self.model = model
+        self.info = MODELS_INFO[model_name]
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
-
-        if self.mode == "Single Model":
-            label, conf = classify_single(pil, *self.single_model_cfg)
-        else:
-            label, conf = classify_ensemble(pil, self.models)
-
-        # Fast drawing (no font load)
         draw = ImageDraw.Draw(pil)
-        draw.text((10, 10), f"{label} ({conf:.0%})", fill="lime")
-
+        if self.model is not None:
+            size = self.info.get("input_size", 224)
+            arr = preprocess_image_pil(pil, size)
+            preds = classify(self.model, arr)
+            label, prob = interpret_stage(preds)
+            if label:
+                draw.text((10, 10), f"{label} ({prob:.1%})", fill="red")
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-# ─── Live Camera ─────────────────────────
-st.subheader("📸 Live Camera Detection")
+def safe_label(name):
+    return re.sub(r"[^\w\s.-]", "_", name)
 
-webrtc_streamer(
-    key="fast-live-drosophila",
-    mode=WebRtcMode.SENDRECV,
-    media_stream_constraints={
-        "video": {"width": {"ideal": 320}, "height": {"ideal": 240}},
-        "audio": False
-    },
-    video_processor_factory=FastProcessor,
-    async_processing=True,
-)
+safe_to_real = {safe_label(n): n for n in MODELS_INFO}
+choice = st.selectbox("Select model", list(safe_to_real.keys())) if MODELS_INFO else None
+model_name = safe_to_real.get(choice)
+model = None
+if model_name:
+    info = MODELS_INFO[model_name]
+    model = load_model_from_hf(model_name, info)
+
+st.markdown("---")
+st.subheader("📷 Upload Image")
+img_file = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
+if img_file and model is not None:
+    pil_img = Image.open(img_file).convert("RGB")
+    st.image(pil_img, use_column_width=True)
+    info = MODELS_INFO[model_name]
+    arr = preprocess_image_pil(pil_img, info.get("input_size", 224))
+    preds = classify(model, arr)
+    label, prob = interpret_stage(preds)
+    if label:
+        st.success(f"Prediction: {label} ({prob:.1%})")
+
+st.markdown("---")
+st.subheader("📸 Live Camera Stage Detection")
+if model is not None:
+    ctx = webrtc_streamer(
+        key="live-stage-detect",
+        mode=WebRtcMode.SENDRECV,
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=StageDetectionProcessor,
+        async_processing=True,
+    )
+else:
+    st.warning("Please select a model first.")
+
+st.markdown("---")
+st.write("**Notes:**")
+st.write(f"- Models from HF: {HF_REPO_ID}")
+st.write("- Only classification models (.h5) are supported.")
+st.write("- Live camera uses PIL for drawing, no font styling for speed.")

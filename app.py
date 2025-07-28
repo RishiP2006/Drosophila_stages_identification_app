@@ -4,11 +4,12 @@ from PIL import Image, ImageDraw
 from huggingface_hub import hf_hub_download, HfApi
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
+import tensorflow as tf
 import re
 
 st.set_page_config(page_title="Drosophila Stage Detection", layout="centered")
 st.title("🧬 Drosophila Stage Detection (Ensemble Mode)")
-st.write("Uses an ensemble of all available models to detect developmental stage via live camera.")
+st.write("Live camera ensemble prediction using multiple stage classification models.")
 
 HF_REPO_ID = "RishiPTrial/stage_modelv2"
 STAGE_LABELS = [
@@ -16,45 +17,39 @@ STAGE_LABELS = [
     "white pupa", "brown pupa", "eye pupa", "black pupa"
 ]
 
+# Preprocessing map
+PREPROCESS_MAP = {
+    'inceptionv3': tf.keras.applications.inception_v3.preprocess_input,
+    'convnext': tf.keras.applications.convnext.preprocess_input,
+    'resnet50': tf.keras.applications.resnet50.preprocess_input,
+}
+
 @st.cache_data(show_spinner=False)
-def list_hf_models():
+def list_models():
     try:
         files = HfApi().list_repo_files(repo_id=HF_REPO_ID)
-        return [f for f in files if f.lower().endswith(".h5")]
+        return [f for f in files if f.endswith(".h5") or f.endswith(".keras")]
     except:
         return []
 
-@st.cache_data(show_spinner=False)
-def build_models_info():
-    info = {}
-    for fname in list_hf_models():
-        size = 299 if "inceptionv3" in fname.lower() else 224
-        info[fname] = size
-    return info
-
-MODELS_INFO = build_models_info()
-if not MODELS_INFO:
-    st.error(f"No .h5 models in {HF_REPO_ID}")
-
-PREPROCESS_MAP = {
-    'inceptionv3': __import__('tensorflow.keras.applications.inception_v3', fromlist=['preprocess_input']).preprocess_input,
-    'convnext': __import__('tensorflow.keras.applications.convnext', fromlist=['preprocess_input']).preprocess_input,
-    'resnet50': __import__('tensorflow.keras.applications.resnet50', fromlist=['preprocess_input']).preprocess_input,
-}
-
 @st.cache_resource(show_spinner=False)
-def load_all_models():
-    import tensorflow as tf
-    models = []
-    for name, size in MODELS_INFO.items():
-        key = 'inceptionv3' if 'inceptionv3' in name.lower() else ('convnext' if 'convnext' in name.lower() else 'resnet50')
-        pre_fn = PREPROCESS_MAP[key]
+def load_ensemble_models():
+    model_files = list_models()
+    ensemble = []
+    for name in model_files:
         path = hf_hub_download(repo_id=HF_REPO_ID, filename=name)
-        model = tf.keras.models.load_model(path, compile=False, custom_objects={'preprocess_input': pre_fn})
-        models.append((model, pre_fn, size))
-    return models
+        size = 299 if 'inceptionv3' in name.lower() else 224
+        key = 'inceptionv3' if 'inceptionv3' in name.lower() else (
+            'convnext' if 'convnext' in name.lower() else 'resnet50')
+        preprocess = PREPROCESS_MAP[key]
+        try:
+            model = tf.keras.models.load_model(path, compile=False, custom_objects={'preprocess_input': preprocess})
+            ensemble.append((model, preprocess, size))
+        except Exception as e:
+            st.warning(f"Skipping model {name}: {e}")
+    return ensemble
 
-ENSEMBLE_MODELS = load_all_models()
+ENSEMBLE_MODELS = load_ensemble_models()
 
 class EnsembleProcessor(VideoProcessorBase):
     def __init__(self):
@@ -71,29 +66,28 @@ class EnsembleProcessor(VideoProcessorBase):
             pred = model.predict(arr[np.newaxis], verbose=0)[0]
             votes += pred
 
-        votes /= len(self.models)
-        idx = np.argmax(votes)
+        idx = int(np.argmax(votes))
         label = STAGE_LABELS[idx]
+        conf = votes[idx] / np.sum(votes)
+
         draw = ImageDraw.Draw(pil)
-        draw.text((10, 10), f"{label} ({votes[idx]:.0%})", fill="lime")
+        draw.text((10, 10), f"{label} ({conf:.0%})", fill="lime")
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-st.subheader("📸 Live Camera Stage Detection (Ensemble)")
+# Start camera
+st.markdown("---")
+st.subheader("📸 Live Camera Ensemble Prediction")
 
-webrtc_streamer(
-    key="ensemblecam",
-    mode=WebRtcMode.SENDONLY,
-    media_stream_constraints={
-        "video": {"width": 160, "height": 120, "frameRate": {"ideal": 15, "max": 15}},
-        "audio": False
-    },
-    video_processor_factory=EnsembleProcessor,
-    async_processing=False,
-    rtc_configuration={"iceServers": []},
-)
+if ENSEMBLE_MODELS:
+    webrtc_streamer(
+        key="ensemblecam",
+        mode=WebRtcMode.SENDRECV,
+        media_stream_constraints={"video": {"width": 320, "height": 240}, "audio": False},
+        video_processor_factory=EnsembleProcessor,
+        async_processing=True,
+    )
+else:
+    st.error("No valid models loaded for ensemble.")
 
 st.markdown("---")
-st.write("**Notes:**")
-st.write("- Using all .h5 models as an ensemble from HF repo: RishiPTrial/stage_modelv2")
-st.write("- Removed single model selection to prioritize faster load time and robustness.")
-st.write("- Ensemble prediction averages model outputs for consistent accuracy.")
+st.write("**Note:** Only ensemble mode is supported. Models are loaded from Hugging Face.")

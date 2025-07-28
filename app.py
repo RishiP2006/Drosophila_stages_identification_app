@@ -3,14 +3,13 @@ import threading
 import streamlit as st
 import numpy as np
 from PIL import Image, ImageDraw
-import re
 from huggingface_hub import hf_hub_download, HfApi
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 
 st.set_page_config(page_title="Drosophila Stage Detection", layout="centered")
 st.title("🧬 Drosophila Stage Detection")
-st.write("Select a model and upload an image or use live camera.")
+st.write("Ensemble mode only: live camera uses all models together.")
 
 # Constants
 HF_REPO_ID = "RishiPTrial/stage_modelv2"
@@ -28,11 +27,9 @@ def list_hf_models():
     except:
         return []
 
-MODELS = list_hf_models()
-if not MODELS:
+MODEL_NAMES = list_hf_models()
+if not MODEL_NAMES:
     st.error(f"No .keras models found in {HF_REPO_ID}")
-
-model_name = st.selectbox("Select model:", MODELS)
 
 # Preprocess map
 PREPROCESS_MAP = {
@@ -41,70 +38,90 @@ PREPROCESS_MAP = {
     'resnet50':   __import__('tensorflow.keras.applications.resnet50',   fromlist=['preprocess_input']).preprocess_input,
 }
 
-# Globals for background-loaded model
-model = None
-pre_fn = None
-model_size = None
+# Globals for background-loaded models
+models = {}
+defute = {'counter': 0, 'last': 'Waiting for models...'}
 
-# Background loader
-def load_model_bg(name):
-    global model, pre_fn, model_size
-    path = hf_hub_download(repo_id=HF_REPO_ID, filename=name)
+# Background loader for all models
+def load_all_models():
     import tensorflow as tf
-    key = 'inceptionv3' if 'inceptionv3' in name.lower() else ('convnext' if 'convnext' in name.lower() else 'resnet50')
-    pre_fn = PREPROCESS_MAP[key]
-    # determine size from name suffix or default
-    model_size = 299 if key=='inceptionv3' else 224
-    # load and warm up
-    m = tf.keras.models.load_model(path, compile=False, custom_objects={'preprocess_input': pre_fn})
-    _ = m.predict(np.zeros((1, model_size, model_size,3), dtype=np.float32), verbose=0)
-    model = m
+    for name in MODEL_NAMES:
+        path = hf_hub_download(repo_id=HF_REPO_ID, filename=name)
+        key = 'inceptionv3' if 'inceptionv3' in name.lower() else ('convnext' if 'convnext' in name.lower() else 'resnet50')
+        pre_fn = PREPROCESS_MAP[key]
+        size = 299 if key == 'inceptionv3' else 224
+        m = tf.keras.models.load_model(path, compile=False, custom_objects={'preprocess_input': pre_fn})
+        # warm-up
+        _ = m.predict(np.zeros((1, size, size, 3), dtype=np.float32), verbose=0)
+        models[name] = (m, pre_fn, size)
 
-# Kick off background load
-threading.Thread(target=load_model_bg, args=(model_name,), daemon=True).start()
+threading.Thread(target=load_all_models, daemon=True).start()
 
-# Simple image uploader classification
-st.subheader("📷 Upload Image")
+# Static image upload still uses ensemble
+st.subheader("📷 Upload Image (Ensemble)")
 file = st.file_uploader("Upload image", type=["jpg","jpeg","png"])
-if file and model is not None:
+if file and models:
     img = Image.open(file).convert("RGB")
-    arr = np.array(img.resize((model_size,model_size))).astype(np.float32)
-    arr = pre_fn(arr)
-    preds = model.predict(arr[np.newaxis], verbose=0)[0]
-    idx = np.argmax(preds)
-    st.image(img, caption=f"{STAGE_LABELS[idx]} ({preds[idx]:.2f})")
+    # ensemble classify
+    votes = []
+    confs = {}
+    for m, fn, sz in models.values():
+        arr = np.array(img.resize((sz, sz))).astype(np.float32)
+        arr = fn(arr)
+        p = m.predict(arr[np.newaxis], verbose=0)[0]
+        idx = np.argmax(p)
+        label = STAGE_LABELS[idx]
+        votes.append(label)
+        confs.setdefault(label, []).append(p[idx])
+    from collections import Counter
+    top = Counter(votes).most_common()
+    if len(top) > 1 and top[0][1] == top[1][1]:
+        avg = {lbl: np.mean(vals) for lbl, vals in confs.items()}
+        choice = max(avg, key=avg.get)
+    else:
+        choice = top[0][0]
+    best_conf = max(confs[choice])
+    st.image(img, caption=f"{choice} ({best_conf:.2f})")
 
 st.markdown("---")
-st.subheader("📸 Live Camera Detection")
-st.write("(Camera preview opens immediately; predictions appear once model is ready)")
+st.subheader("📸 Live Camera Ensemble Detection")
+st.write("Camera preview opens immediately; ensemble predictions appear once models are ready.")
 
-# Processor with frame skipping
-defute = {'counter':0, 'last':f"Waiting..."}
-class FastProcessor(VideoProcessorBase):
+class EnsembleProcessor(VideoProcessorBase):
+    def __init__(self):
+        pass
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        arr_frame = frame.to_ndarray(format="rgb24")
-        pil = Image.fromarray(arr_frame)
-        # only predict every 5th frame and if model ready
-        de = de
+        pil = Image.fromarray(frame.to_ndarray(format="rgb24"))
         defute['counter'] += 1
-        if model is not None and defute['counter'] % 5 == 0:
-            img_arr = np.array(pil.resize((model_size,model_size))).astype(np.float32)
-            img_arr = pre_fn(img_arr)
-            preds = model.predict(img_arr[np.newaxis],verbose=0)[0]
-            idx = np.argmax(preds)
-            defute['last'] = f"{STAGE_LABELS[idx]} ({preds[idx]:.0%})"
-        # draw label
+        label = defute['last']
+        if models and defute['counter'] % 5 == 0:
+            votes = []
+            confs = {}
+            for m, fn, sz in models.values():
+                arr = np.array(pil.resize((sz, sz))).astype(np.float32)
+                arr = fn(arr)
+                p = m.predict(arr[np.newaxis], verbose=0)[0]
+                idx = np.argmax(p)
+                lbl = STAGE_LABELS[idx]
+                votes.append(lbl)
+                confs.setdefault(lbl, []).append(p[idx])
+            from collections import Counter
+            top = Counter(votes).most_common()
+            if len(top) > 1 and top[0][1] == top[1][1]:
+                avg = {lbl: np.mean(vals) for lbl, vals in confs.items()}
+                choice = max(avg, key=avg.get)
+            else:
+                choice = top[0][0]
+            defute['last'] = f"{choice} ({max(confs[choice]):.0%})"
+            label = defute['last']
         draw = ImageDraw.Draw(pil)
-        draw.text((10,10), defute['last'], fill="lime")
+        draw.text((10,10), label, fill="lime")
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
 webrtc_streamer(
-    key="fastcam",
+    key="ensemblecam",
     mode=WebRtcMode.SENDRECV,
-    media_stream_constraints={
-        "video": {"width":160, "height":120, "frameRate":{"ideal":15, "max":15}},
-        "audio": False
-    },
-    video_processor_factory=FastProcessor,
-    async_processing=True
+    media_stream_constraints={"video": {"width":160,"height":120,"frameRate":{"ideal":15,"max":15}},"audio":False},
+    video_processor_factory=EnsembleProcessor,
+    async_processing=True,
 )

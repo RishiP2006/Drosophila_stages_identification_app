@@ -1,4 +1,5 @@
 import sys
+import threading
 import streamlit as st
 import numpy as np
 from PIL import Image, ImageDraw
@@ -18,88 +19,92 @@ STAGE_LABELS = [
     "white pupa", "brown pupa", "eye pupa", "black pupa"
 ]
 
-# List and build model info
+# Discover .keras models in repo
 @st.cache_data(show_spinner=False)
 def list_hf_models():
     try:
         files = HfApi().list_repo_files(repo_id=HF_REPO_ID)
-        return [f for f in files if f.lower().endswith(".h5")]
+        return [f for f in files if f.lower().endswith(".keras")]
     except:
         return []
 
-@st.cache_data(show_spinner=False)
-def build_models_info():
-    info = {}
-    for fname in list_hf_models():
-        size = 299 if "inceptionv3" in fname.lower() else 224
-        info[fname] = size
-    return info
+MODELS = list_hf_models()
+if not MODELS:
+    st.error(f"No .keras models found in {HF_REPO_ID}")
 
-MODELS_INFO = build_models_info()
-if not MODELS_INFO:
-    st.error(f"No .h5 models in {HF_REPO_ID}")
+model_name = st.selectbox("Select model:", MODELS)
 
-# Lazy load preprocess functions map
+# Preprocess map
 PREPROCESS_MAP = {
     'inceptionv3': __import__('tensorflow.keras.applications.inception_v3', fromlist=['preprocess_input']).preprocess_input,
-    'convnext': __import__('tensorflow.keras.applications.convnext', fromlist=['preprocess_input']).preprocess_input,
-    'resnet50': __import__('tensorflow.keras.applications.resnet50', fromlist=['preprocess_input']).preprocess_input,
+    'convnext':   __import__('tensorflow.keras.applications.convnext',   fromlist=['preprocess_input']).preprocess_input,
+    'resnet50':   __import__('tensorflow.keras.applications.resnet50',   fromlist=['preprocess_input']).preprocess_input,
 }
 
-# Load selected model (cached)
-@st.cache_resource(show_spinner=False)
-def load_model(name, size):
+# Globals for background-loaded model
+model = None
+pre_fn = None
+model_size = None
+
+# Background loader
+def load_model_bg(name):
+    global model, pre_fn, model_size
     path = hf_hub_download(repo_id=HF_REPO_ID, filename=name)
     import tensorflow as tf
-    # choose preprocess fn by name key
     key = 'inceptionv3' if 'inceptionv3' in name.lower() else ('convnext' if 'convnext' in name.lower() else 'resnet50')
-    preprocess_fn = PREPROCESS_MAP[key]
-    model = tf.keras.models.load_model(path, compile=False, custom_objects={'preprocess_input': preprocess_fn})
-    return model, preprocess_fn, size
+    pre_fn = PREPROCESS_MAP[key]
+    # determine size from name suffix or default
+    model_size = 299 if key=='inceptionv3' else 224
+    # load and warm up
+    m = tf.keras.models.load_model(path, compile=False, custom_objects={'preprocess_input': pre_fn})
+    _ = m.predict(np.zeros((1, model_size, model_size,3), dtype=np.float32), verbose=0)
+    model = m
 
-# UI model selector
-model_name = st.selectbox("Select model:", list(MODELS_INFO.keys()))
-selected_size = MODELS_INFO.get(model_name, 224)
-model, preprocess_fn, model_size = load_model(model_name, selected_size)
+# Kick off background load
+threading.Thread(target=load_model_bg, args=(model_name,), daemon=True).start()
 
-# Image upload
+# Simple image uploader classification
 st.subheader("📷 Upload Image")
 file = st.file_uploader("Upload image", type=["jpg","jpeg","png"])
-if file:
+if file and model is not None:
     img = Image.open(file).convert("RGB")
     arr = np.array(img.resize((model_size,model_size))).astype(np.float32)
-    arr = preprocess_fn(arr)
-    preds = model.predict(arr[np.newaxis],verbose=0)[0]
+    arr = pre_fn(arr)
+    preds = model.predict(arr[np.newaxis], verbose=0)[0]
     idx = np.argmax(preds)
     st.image(img, caption=f"{STAGE_LABELS[idx]} ({preds[idx]:.2f})")
 
 st.markdown("---")
 st.subheader("📸 Live Camera Detection")
+st.write("(Camera preview opens immediately; predictions appear once model is ready)")
 
-# Video processor with lazy model already loaded above
+# Processor with frame skipping
+defute = {'counter':0, 'last':f"Waiting..."}
 class FastProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.model = model
-        self.pre_fn = preprocess_fn
-        self.size = model_size
-
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="rgb24")
-        pil = Image.fromarray(img)
-        arr = np.array(pil.resize((self.size,self.size))).astype(np.float32)
-        arr = self.pre_fn(arr)
-        preds = self.model.predict(arr[np.newaxis],verbose=0)[0]
-        idx = np.argmax(preds)
-        label = STAGE_LABELS[idx]
-        # draw simple text
+        arr_frame = frame.to_ndarray(format="rgb24")
+        pil = Image.fromarray(arr_frame)
+        # only predict every 5th frame and if model ready
+        de = de
+        defute['counter'] += 1
+        if model is not None and defute['counter'] % 5 == 0:
+            img_arr = np.array(pil.resize((model_size,model_size))).astype(np.float32)
+            img_arr = pre_fn(img_arr)
+            preds = model.predict(img_arr[np.newaxis],verbose=0)[0]
+            idx = np.argmax(preds)
+            defute['last'] = f"{STAGE_LABELS[idx]} ({preds[idx]:.0%})"
+        # draw label
         draw = ImageDraw.Draw(pil)
-        draw.text((10,10), f"{label} ({preds[idx]:.0%})", fill="lime")
+        draw.text((10,10), defute['last'], fill="lime")
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
 webrtc_streamer(
     key="fastcam",
     mode=WebRtcMode.SENDRECV,
-    media_stream_constraints={"video": {"width":320,"height":240}, "audio": False},
+    media_stream_constraints={
+        "video": {"width":160, "height":120, "frameRate":{"ideal":15, "max":15}},
+        "audio": False
+    },
     video_processor_factory=FastProcessor,
-    async_processing=True,
+    async_processing=True
 )

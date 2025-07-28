@@ -1,70 +1,103 @@
 import streamlit as st
+st.set_page_config(layout="centered")
+
 import numpy as np
-from PIL import Image, ImageDraw
-import tensorflow as tf
-from huggingface_hub import hf_hub_download
+from PIL import Image, ImageDraw, ImageFont
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
+from huggingface_hub import hf_hub_download
+from tensorflow.keras.models import load_model as lm
+from tensorflow.keras.applications.inception_v3 import preprocess_input
 
-# ----------------------------
-# Basic Setup
-# ----------------------------
-st.set_page_config(page_title="ResNet Drosophila Detector", layout="centered")
-st.title("🧬 Drosophila Stage Detection (ResNet Only)")
-
-# ----------------------------
-# Constants
-# ----------------------------
+# ─── Model Load ───────────────────────────
 HF_REPO_ID = "RishiPTrial/stage_modelv2"
-RESNET_MODEL_NAME = "drosophila_stage_resnet50_finetuned_IIT.keras"
+MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
 STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
-    "white pupa", "brown pupa", "eye pupa", "black pupa"
+    "white pupa", "brown pupa", "eye pupa"
 ]
 
-# ----------------------------
-# Load ResNet50 Model
-# ----------------------------
-@st.cache_resource(show_spinner=True)
-def load_resnet_model():
-    model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=RESNET_MODEL_NAME)
-    preprocess_input = tf.keras.applications.resnet50.preprocess_input
-    model = tf.keras.models.load_model(model_path, compile=False, custom_objects={'preprocess_input': preprocess_input})
-    return model, preprocess_input
+@st.cache_resource
+def load_model():
+    path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE)
+    return lm(path, compile=False), 299
 
-model, preprocess_input = load_resnet_model()
-model_size = 224  # ResNet input size
+model, input_size = load_model()
 
-# ----------------------------
-# Live Camera Prediction
-# ----------------------------
-st.subheader("📸 Live Camera Prediction (ResNet50)")
+# ─── Image Preprocessing ─────────────────
+def preprocess_image(pil: Image.Image):
+    pil = pil.resize((input_size, input_size)).convert("RGB")
+    arr = np.asarray(pil, np.float32)
+    return preprocess_input(arr)
 
-class ResNetProcessor(VideoProcessorBase):
+# ─── Prediction ──────────────────────────
+def classify(pil: Image.Image):
+    arr = preprocess_image(pil)
+    preds = model.predict(arr[np.newaxis], verbose=0)[0]
+    idx = int(np.argmax(preds))
+    return STAGE_LABELS[idx], float(preds[idx])
+
+# ─── UI Setup ─────────────────────────────
+st.title("Live Drosophila Detection")
+st.subheader("📹 Live Camera Detection with Stable Prediction")
+
+# ─── Session State ───────────────────────
+if "stable_prediction" not in st.session_state:
+    st.session_state["stable_prediction"] = "Waiting..."
+
+# ─── Video Processor ─────────────────────
+class StableProcessor(VideoProcessorBase):
     def __init__(self):
-        self.model = model
-        self.preprocess = preprocess_input
-        self.size = model_size
+        self.last_label = None
+        self.count = 0
+        self.stable_label = None
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        print("Processing frame...")  # DEBUG: Check if this is running
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
-        arr = np.array(pil.resize((self.size, self.size))).astype(np.float32)
-        arr = self.preprocess(arr)
-        preds = self.model.predict(np.expand_dims(arr, axis=0), verbose=0)[0]
-        idx = np.argmax(preds)
-        label = f"{STAGE_LABELS[idx]} ({preds[idx]:.0%})"
+
+        label, conf = classify(pil)
+
+        # Stability check
+        if label == self.last_label:
+            self.count += 1
+        else:
+            self.last_label = label
+            self.count = 1
+
+        # Set stable label
+        if self.count >= 3:
+            self.stable_label = label
+            # Safely update session state only if key exists
+            if "stable_prediction" in st.session_state:
+                st.session_state["stable_prediction"] = self.stable_label
+
+        # Draw label with background box
         draw = ImageDraw.Draw(pil)
-        draw.text((10, 10), label, fill="lime")
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        text = f"{label} ({conf:.0%})"
+        text_size = draw.textbbox((0, 0), text, font=font)
+        padding = 6
+        bg_rect = [
+            text_size[0] - padding,
+            text_size[1] - padding,
+            text_size[2] + padding,
+            text_size[3] + padding
+        ]
+        draw.rectangle(bg_rect, fill="black")
+        draw.text((0, 0), text, font=font, fill="red")
+
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-# Start WebRTC Camera
-webrtc_streamer(
-    key="resnet-live",
+# ─── Start Webcam ────────────────────────
+webrtc_ctx = webrtc_streamer(
+    key="live",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
-    video_processor_factory=ResNetProcessor,
-    async_processing=True,
-    video_html_attrs={"playsinline": True},
+    video_processor_factory=StableProcessor,
+    async_processing=True
 )
+
+# ─── Display Stable Result ───────────────
+st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
+st.success(st.session_state.get("stable_prediction", "Waiting..."))

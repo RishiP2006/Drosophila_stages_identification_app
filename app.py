@@ -10,7 +10,7 @@ st.set_page_config(page_title="Drosophila Gender Detection", layout="centered")
 st.title("🩰 Drosophila Gender Detection")
 st.write("Upload an image or use live camera. Predictions are made using ensemble of all available `.h5` models.")
 
-HF_REPO_ID = "RishiPTrial/models_h5"
+HF_REPO_ID = "RishiPTrial/stage_modelv2"
 
 @st.cache_data(show_spinner=False)
 def list_h5_models():

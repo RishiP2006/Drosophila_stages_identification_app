@@ -1,108 +1,103 @@
 import streamlit as st
+st.set_page_config(layout="centered")
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from huggingface_hub import hf_hub_download, HfApi
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
-import re
+from huggingface_hub import hf_hub_download
+from tensorflow.keras.models import load_model as lm
+from tensorflow.keras.applications.inception_v3 import preprocess_input
 
-st.set_page_config(page_title="Drosophila Gender Detection", layout="centered")
-st.title("🩰 Drosophila Gender Detection")
-st.write("Upload an image or use live camera. Predictions are made using ensemble of all available `.h5` models.")
+# ─── Model Load ───────────────────────────
+HF_REPO_ID = "RishiPTrial/my-model-name"
+MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
+STAGE_LABELS = [
+    "egg", "1st instar", "2nd instar", "3rd instar",
+    "white pupa", "brown pupa", "eye pupa"
+]
 
-HF_REPO_ID = "RishiPTrial/stage_modelv2"
+@st.cache_resource
+def load_model():
+    path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE)
+    return lm(path, compile=False), 299
 
-@st.cache_data(show_spinner=False)
-def list_h5_models():
-    api = HfApi()
-    try:
-        files = api.list_repo_files(repo_id=HF_REPO_ID)
-        return [f for f in files if f.lower().endswith(".h5")]
-    except Exception as e:
-        st.error(f"Failed to list models: {e}")
-        return []
+model, input_size = load_model()
 
-@st.cache_resource(show_spinner=False)
-def load_all_h5_models():
-    try:
-        import tensorflow as tf
-    except ImportError:
-        st.error("TensorFlow not available.")
-        return []
+# ─── Image Preprocessing ─────────────────
+def preprocess_image(pil: Image.Image):
+    pil = pil.resize((input_size, input_size)).convert("RGB")
+    arr = np.asarray(pil, np.float32)
+    return preprocess_input(arr)
 
-    model_paths = [hf_hub_download(repo_id=HF_REPO_ID, filename=name) for name in list_h5_models()]
-    models = []
-    for path in model_paths:
-        try:
-            models.append(tf.keras.models.load_model(path))
-        except Exception as e:
-            st.warning(f"Failed to load {path}: {e}")
-    return models
+# ─── Prediction ──────────────────────────
+def classify(pil: Image.Image):
+    arr = preprocess_image(pil)
+    preds = model.predict(arr[np.newaxis], verbose=0)[0]
+    idx = int(np.argmax(preds))
+    return STAGE_LABELS[idx], float(preds[idx])
 
-models = load_all_h5_models()
-if not models:
-    st.error("No `.h5` models found or loaded.")
+# ─── UI Setup ─────────────────────────────
+st.title("Live Drosophila Detection")
+st.subheader("📹 Live Camera Detection with Stable Prediction")
 
-def preprocess_image_pil(pil_img: Image.Image, size: int = 224):
-    arr = pil_img.resize((size, size))
-    arr = np.asarray(arr).astype(np.float32) / 255.0
-    return arr
+# ─── Session State ───────────────────────
+if "stable_prediction" not in st.session_state:
+    st.session_state["stable_prediction"] = "Waiting..."
 
-def ensemble_predict(models, img_array):
-    x = np.expand_dims(img_array, axis=0)
-    predictions = [model.predict(x)[0][0] for model in models]
-    avg_pred = np.mean(predictions)
-    label = "Female" if avg_pred >= 0.5 else "Male"
-    confidence = avg_pred if label == "Female" else 1 - avg_pred
-    return label, confidence
-
-# Upload Image Section
-st.markdown("---")
-st.subheader("📷 Upload Image")
-img_file = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
-if img_file and models:
-    pil_img = Image.open(img_file).convert("RGB")
-    st.image(pil_img, use_column_width=True)
-    arr = preprocess_image_pil(pil_img)
-    label, prob = ensemble_predict(models, arr)
-    st.success(f"Prediction: {label} ({prob:.1%})")
-
-# Live Camera Section
-st.markdown("---")
-st.subheader("📸 Live Camera Gender Detection")
-
-class GenderDetectionProcessor(VideoProcessorBase):
+# ─── Video Processor ─────────────────────
+class StableProcessor(VideoProcessorBase):
     def __init__(self):
-        self.models = models
+        self.last_label = None
+        self.count = 0
+        self.stable_label = None
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
-        draw = ImageDraw.Draw(pil)
-        try:
-            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
-        except Exception:
-            font = ImageFont.load_default()
 
-        arr = preprocess_image_pil(pil)
-        label, prob = ensemble_predict(self.models, arr)
-        draw.text((10, 10), f"{label} ({prob:.1%})", fill="red", font=font)
+        label, conf = classify(pil)
+
+        # Stability check
+        if label == self.last_label:
+            self.count += 1
+        else:
+            self.last_label = label
+            self.count = 1
+
+        # Set stable label
+        if self.count >= 3:
+            self.stable_label = label
+            # Safely update session state only if key exists
+            if "stable_prediction" in st.session_state:
+                st.session_state["stable_prediction"] = self.stable_label
+
+        # Draw label with background box
+        draw = ImageDraw.Draw(pil)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        text = f"{label} ({conf:.0%})"
+        text_size = draw.textbbox((0, 0), text, font=font)
+        padding = 6
+        bg_rect = [
+            text_size[0] - padding,
+            text_size[1] - padding,
+            text_size[2] + padding,
+            text_size[3] + padding
+        ]
+        draw.rectangle(bg_rect, fill="black")
+        draw.text((0, 0), text, font=font, fill="red")
 
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-if models:
-    webrtc_streamer(
-        key="live-gender-detect",
-        mode=WebRtcMode.SENDRECV,
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=GenderDetectionProcessor,
-        async_processing=True,
-    )
-else:
-    st.warning("Please upload valid `.h5` models to Hugging Face first.")
+# ─── Start Webcam ────────────────────────
+webrtc_ctx = webrtc_streamer(
+    key="live",
+    mode=WebRtcMode.SENDRECV,
+    media_stream_constraints={"video": True, "audio": False},
+    video_processor_factory=StableProcessor,
+    async_processing=True
+)
 
-st.markdown("---")
-st.write("**Notes:**")
-st.write(f"- Models are loaded from Hugging Face repo: `{HF_REPO_ID}`")
-st.write("- Ensemble of all available `.h5` models is used.")
-st.write("- Streamlit WebRTC + PIL is used for real-time processing.")
+# ─── Display Stable Result ───────────────
+st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
+st.success(st.session_state.get("stable_prediction", "Waiting..."))

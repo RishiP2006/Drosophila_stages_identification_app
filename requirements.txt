@@ -1,8 +1,8 @@
 streamlit==1.38.0
 streamlit-webrtc==0.47.6
 aiortc==1.13.0
-av==14.0.1            # aiortc 1.13 requires av >=14,<15
-pyee==13.1.0          # satisfy aiortc's pyee>=13
+av==14.0.1
+pyee==13.1.0
 numpy==1.26.4
 tensorflow==2.16.1
 keras==3.3.3

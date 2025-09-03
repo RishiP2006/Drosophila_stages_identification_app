@@ -2,34 +2,78 @@
 import streamlit as st
 st.set_page_config(layout="centered")
 
-import os
+import json
 import numpy as np
+import h5py
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 from huggingface_hub import hf_hub_download
-from tensorflow.keras.models import load_model as tfk_load_model
+from tensorflow.keras.models import load_model as tfk_load_model, model_from_json
 from tensorflow.keras.applications.inception_v3 import preprocess_input
 
 # ─── Config ─────────────────────────────────────────────────────────────────────
 HF_REPO_ID = "RishiPTrial/my-model-name"
 MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
-INPUT_SIZE = 299  # InceptionV3 default
+INPUT_SIZE = 299
 STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
     "white pupa", "brown pupa", "eye pupa"
 ]
 
+# ─── Helpers ────────────────────────────────────────────────────────────────────
+def _patch_config_batch_shape_to_batch_input_shape(cfg: dict) -> dict:
+    """
+    Recursively walk a Keras model config dict and rename 'batch_shape' -> 'batch_input_shape'
+    in any layer configs (esp. InputLayer). Returns a modified copy.
+    """
+    def fix_layer(layer):
+        if isinstance(layer, dict):
+            # If it's a Keras layer config
+            if "class_name" in layer and "config" in layer and isinstance(layer["config"], dict):
+                if "batch_shape" in layer["config"] and "batch_input_shape" not in layer["config"]:
+                    layer["config"]["batch_input_shape"] = layer["config"].pop("batch_shape")
+            # Recurse into nested structures
+            for k, v in list(layer.items()):
+                if isinstance(v, dict):
+                    layer[k] = fix_layer(v)
+                elif isinstance(v, list):
+                    layer[k] = [fix_layer(x) if isinstance(x, dict) else x for x in v]
+        return layer
+
+    cfg = json.loads(json.dumps(cfg))  # deep copy
+    return fix_layer(cfg)
+
+def _load_model_with_patch(h5_path: str):
+    """
+    Fallback loader:
+      - Read the JSON config from the H5
+      - Patch 'batch_shape' -> 'batch_input_shape'
+      - Rebuild model from JSON
+      - Load weights from the same H5
+    """
+    with h5py.File(h5_path, "r") as f:
+        # Keras stores the architecture JSON in the model_config attribute
+        model_config_json = f.attrs.get("model_config")
+        if model_config_json is None:
+            raise ValueError("H5 file has no 'model_config' attribute.")
+        if isinstance(model_config_json, bytes):
+            model_config_json = model_config_json.decode("utf-8")
+
+        cfg = json.loads(model_config_json)
+        cfg_patched = _patch_config_batch_shape_to_batch_input_shape(cfg)
+        patched_json = json.dumps(cfg_patched)
+
+    model = model_from_json(patched_json)
+    # Load weights from the same file
+    model.load_weights(h5_path)
+    return model
+
 # ─── Cache + Load Model ─────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_model():
-    """
-    Load a Keras (TF 2.x) H5 model artifact from the Hugging Face Hub.
-    On Streamlit Cloud, make sure your requirements pin tensorflow==2.12.1.
-    """
+    token = st.secrets.get("HF_TOKEN", None)
     try:
-        # If your HF repo is private, set HF_TOKEN in Streamlit secrets.
-        token = st.secrets.get("HF_TOKEN", None)
         model_path = hf_hub_download(
             repo_id=HF_REPO_ID,
             filename=MODEL_FILE,
@@ -39,18 +83,29 @@ def load_model():
         st.error(f"Could not download model file '{MODEL_FILE}' from '{HF_REPO_ID}': {e}")
         st.stop()
 
+    # 1) Try the normal loader first
     try:
-        model = tfk_load_model(model_path, compile=False)
+        return tfk_load_model(model_path, compile=False)
     except Exception as e:
+        msg = str(e)
+        # 2) If it failed due to the 'batch_shape' InputLayer issue, use the patch loader
+        if "batch_shape" in msg and "InputLayer" in msg:
+            try:
+                patched = _load_model_with_patch(model_path)
+                return patched
+            except Exception as e2:
+                st.error(
+                    "Tried to patch-load the model (convert 'batch_shape' → 'batch_input_shape') "
+                    f"but failed.\n\nPatch loader error: {e2}"
+                )
+                st.stop()
+        # Otherwise show the original error
         st.error(
-            "Model load failed. If you're on Streamlit Cloud, ensure your "
-            "`requirements.txt` pins tensorflow==2.12.1 (which uses tf.keras 2.x) "
-            "and a compatible numpy (e.g., 1.26.4)."
-            f"\n\nLoader error: {e}"
+            "Model load failed. Ensure your requirements pin "
+            "tensorflow==2.12.1 and numpy==1.24.3 for legacy H5 models.\n\n"
+            f"Loader error: {e}"
         )
         st.stop()
-
-    return model
 
 model = load_model()
 
@@ -58,8 +113,7 @@ model = load_model()
 def preprocess_image(pil: Image.Image) -> np.ndarray:
     pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
     arr = np.asarray(pil, dtype=np.float32)
-    # InceptionV3 preprocess_input -> scales to [-1, 1]
-    arr = preprocess_input(arr)
+    arr = preprocess_input(arr)  # InceptionV3 scaling [-1, 1]
     return arr
 
 # ─── Prediction ─────────────────────────────────────────────────────────────────
@@ -73,7 +127,6 @@ def classify(pil: Image.Image):
 st.title("Live Drosophila Detection")
 st.subheader("📹 Live Camera Detection with Stable Prediction")
 
-# Session state for stable prediction text
 if "stable_prediction" not in st.session_state:
     st.session_state["stable_prediction"] = "Waiting..."
 
@@ -83,7 +136,6 @@ class StableProcessor(VideoProcessorBase):
         self.last_label = None
         self.count = 0
         self.stable_label = None
-        # Prepare font with fallback (cloud images often lack system fonts)
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
@@ -95,28 +147,23 @@ class StableProcessor(VideoProcessorBase):
 
         label, conf = classify(pil)
 
-        # Stability check over consecutive frames
+        # Stability check
         if label == self.last_label:
             self.count += 1
         else:
             self.last_label = label
             self.count = 1
 
-        # Set stable label after 3 consistent frames
         if self.count >= 3:
             self.stable_label = label
             st.session_state["stable_prediction"] = self.stable_label
 
-        # Draw label with a background box
         draw = ImageDraw.Draw(pil)
         text = f"{label} ({conf:.0%})"
 
-        # Compute text box
         try:
-            # Newer Pillow: textbbox
             bbox = draw.textbbox((0, 0), text, font=self.font)
         except Exception:
-            # Fallback for very old Pillow
             w, h = draw.textsize(text, font=self.font)
             bbox = (0, 0, w, h)
 

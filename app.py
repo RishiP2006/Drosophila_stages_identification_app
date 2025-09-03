@@ -1,56 +1,93 @@
+# app.py
 import streamlit as st
 st.set_page_config(layout="centered")
 
+import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 from huggingface_hub import hf_hub_download
-from tensorflow.keras.models import load_model as lm
+from tensorflow.keras.models import load_model as tfk_load_model
 from tensorflow.keras.applications.inception_v3 import preprocess_input
 
-# ─── Model Load ───────────────────────────
+# ─── Config ─────────────────────────────────────────────────────────────────────
 HF_REPO_ID = "RishiPTrial/my-model-name"
 MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
+INPUT_SIZE = 299  # InceptionV3 default
 STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
     "white pupa", "brown pupa", "eye pupa"
 ]
 
-@st.cache_resource
+# ─── Cache + Load Model ─────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_model():
-    path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE)
-    return lm(path, compile=False), 299
+    """
+    Load a Keras (TF 2.x) H5 model artifact from the Hugging Face Hub.
+    On Streamlit Cloud, make sure your requirements pin tensorflow==2.12.1.
+    """
+    try:
+        # If your HF repo is private, set HF_TOKEN in Streamlit secrets.
+        token = st.secrets.get("HF_TOKEN", None)
+        model_path = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=MODEL_FILE,
+            token=token
+        )
+    except Exception as e:
+        st.error(f"Could not download model file '{MODEL_FILE}' from '{HF_REPO_ID}': {e}")
+        st.stop()
 
-model, input_size = load_model()
+    try:
+        model = tfk_load_model(model_path, compile=False)
+    except Exception as e:
+        st.error(
+            "Model load failed. If you're on Streamlit Cloud, ensure your "
+            "`requirements.txt` pins tensorflow==2.12.1 (which uses tf.keras 2.x) "
+            "and a compatible numpy (e.g., 1.26.4)."
+            f"\n\nLoader error: {e}"
+        )
+        st.stop()
 
-# ─── Image Preprocessing ─────────────────
-def preprocess_image(pil: Image.Image):
-    pil = pil.resize((input_size, input_size)).convert("RGB")
-    arr = np.asarray(pil, np.float32)
-    return preprocess_input(arr)
+    return model
 
-# ─── Prediction ──────────────────────────
+model = load_model()
+
+# ─── Image Preprocessing ────────────────────────────────────────────────────────
+def preprocess_image(pil: Image.Image) -> np.ndarray:
+    pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
+    arr = np.asarray(pil, dtype=np.float32)
+    # InceptionV3 preprocess_input -> scales to [-1, 1]
+    arr = preprocess_input(arr)
+    return arr
+
+# ─── Prediction ─────────────────────────────────────────────────────────────────
 def classify(pil: Image.Image):
     arr = preprocess_image(pil)
     preds = model.predict(arr[np.newaxis], verbose=0)[0]
     idx = int(np.argmax(preds))
     return STAGE_LABELS[idx], float(preds[idx])
 
-# ─── UI Setup ─────────────────────────────
+# ─── UI ─────────────────────────────────────────────────────────────────────────
 st.title("Live Drosophila Detection")
 st.subheader("📹 Live Camera Detection with Stable Prediction")
 
-# ─── Session State ───────────────────────
+# Session state for stable prediction text
 if "stable_prediction" not in st.session_state:
     st.session_state["stable_prediction"] = "Waiting..."
 
-# ─── Video Processor ─────────────────────
+# ─── Video Processor ────────────────────────────────────────────────────────────
 class StableProcessor(VideoProcessorBase):
     def __init__(self):
         self.last_label = None
         self.count = 0
         self.stable_label = None
+        # Prepare font with fallback (cloud images often lack system fonts)
+        try:
+            self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        except Exception:
+            self.font = ImageFont.load_default()
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="rgb24")
@@ -58,38 +95,44 @@ class StableProcessor(VideoProcessorBase):
 
         label, conf = classify(pil)
 
-        # Stability check
+        # Stability check over consecutive frames
         if label == self.last_label:
             self.count += 1
         else:
             self.last_label = label
             self.count = 1
 
-        # Set stable label
+        # Set stable label after 3 consistent frames
         if self.count >= 3:
             self.stable_label = label
-            # Safely update session state only if key exists
-            if "stable_prediction" in st.session_state:
-                st.session_state["stable_prediction"] = self.stable_label
+            st.session_state["stable_prediction"] = self.stable_label
 
-        # Draw label with background box
+        # Draw label with a background box
         draw = ImageDraw.Draw(pil)
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         text = f"{label} ({conf:.0%})"
-        text_size = draw.textbbox((0, 0), text, font=font)
+
+        # Compute text box
+        try:
+            # Newer Pillow: textbbox
+            bbox = draw.textbbox((0, 0), text, font=self.font)
+        except Exception:
+            # Fallback for very old Pillow
+            w, h = draw.textsize(text, font=self.font)
+            bbox = (0, 0, w, h)
+
         padding = 6
         bg_rect = [
-            text_size[0] - padding,
-            text_size[1] - padding,
-            text_size[2] + padding,
-            text_size[3] + padding
+            bbox[0] - padding,
+            bbox[1] - padding,
+            bbox[2] + padding,
+            bbox[3] + padding
         ]
         draw.rectangle(bg_rect, fill="black")
-        draw.text((0, 0), text, font=font, fill="red")
+        draw.text((0, 0), text, font=self.font, fill="red")
 
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-# ─── Start Webcam ────────────────────────
+# ─── Start Webcam ───────────────────────────────────────────────────────────────
 webrtc_ctx = webrtc_streamer(
     key="live",
     mode=WebRtcMode.SENDRECV,
@@ -98,6 +141,6 @@ webrtc_ctx = webrtc_streamer(
     async_processing=True
 )
 
-# ─── Display Stable Result ───────────────
+# ─── Display Stable Result ──────────────────────────────────────────────────────
 st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
 st.success(st.session_state.get("stable_prediction", "Waiting..."))

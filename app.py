@@ -2,6 +2,14 @@
 import streamlit as st
 st.set_page_config(layout="centered")
 
+# --- Compatibility shim: some streamlit-webrtc versions call st.experimental_rerun,
+# --- which may not exist on newer Streamlit. Alias it to st.rerun if missing.
+if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
+    try:
+        st.experimental_rerun = st.rerun  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
@@ -20,6 +28,11 @@ STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
     "white pupa", "brown pupa", "eye pupa"
 ]
+
+# Basic STUN so WebRTC can discover peers on Cloud
+RTC_CONFIGURATION = {
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+}
 
 # ─── Load Model (Keras 3) ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
@@ -57,7 +70,6 @@ def draw_label(pil: Image.Image, label: str, conf: float) -> Image.Image:
         font = ImageFont.load_default()
 
     text = f"{label} ({conf:.0%})"
-    # Compute text box (with fallback)
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -74,7 +86,6 @@ def draw_label(pil: Image.Image, label: str, conf: float) -> Image.Image:
 st.title("Live Drosophila Detection")
 st.subheader("📹 Live Camera Detection with Stable Prediction")
 
-# Session state for stable prediction text
 if "stable_prediction" not in st.session_state:
     st.session_state["stable_prediction"] = "Waiting..."
 
@@ -95,7 +106,6 @@ class StableProcessor(VideoProcessorBase):
 
         label, conf, _ = classify(pil)
 
-        # Stability check over consecutive frames
         if label == self.last_label:
             self.count += 1
         else:
@@ -108,8 +118,6 @@ class StableProcessor(VideoProcessorBase):
 
         draw = ImageDraw.Draw(pil)
         text = f"{label} ({conf:.0%})"
-
-        # Compute text box (with fallback)
         try:
             bbox = draw.textbbox((0, 0), text, font=self.font)
             w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -128,6 +136,7 @@ webrtc_ctx = webrtc_streamer(
     key="live",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
+    rtc_configuration=RTC_CONFIGURATION,   # <— add this
     video_processor_factory=StableProcessor,
     async_processing=True
 )
@@ -149,24 +158,19 @@ if uploaded is not None:
     pil_in = Image.open(uploaded).convert("RGB")
     label, conf, probs = classify(pil_in)
 
-    # Show prediction
     col1, col2 = st.columns([1, 1])
     with col1:
         st.subheader("Prediction")
         st.write(f"**Stage:** {label}")
         st.write(f"**Confidence:** {conf:.2%}")
 
-    # Show annotated preview
     annotated = draw_label(pil_in, label, conf)
     with col2:
         st.subheader("Annotated Preview")
         st.image(annotated, use_column_width=True)
 
-    # Optional: show class scores
     with st.expander("Show class probabilities"):
-        # Build a simple table of label -> probability
         rows = [(lab, float(p)) for lab, p in zip(STAGE_LABELS, probs)]
-        # Sort descending by probability
         rows.sort(key=lambda x: x[1], reverse=True)
         for lab, p in rows:
             st.write(f"{lab}: {p:.2%}")

@@ -1,14 +1,11 @@
 # app.py
+import time
 import streamlit as st
 st.set_page_config(layout="centered")
 
-# --- Compatibility shim: some streamlit-webrtc versions call st.experimental_rerun,
-# --- which may not exist on newer Streamlit. Alias it to st.rerun if missing.
+# --- Compat shim: some streamlit-webrtc versions call st.experimental_rerun
 if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
-    try:
-        st.experimental_rerun = st.rerun  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    st.experimental_rerun = st.rerun  # type: ignore[attr-defined]
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -28,73 +25,67 @@ STAGE_LABELS = [
     "egg", "1st instar", "2nd instar", "3rd instar",
     "white pupa", "brown pupa", "eye pupa"
 ]
-
-# Basic STUN so WebRTC can discover peers on Cloud
-RTC_CONFIGURATION = {
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-}
+RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
 # ─── Load Model (Keras 3) ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_model():
     token = st.secrets.get("HF_TOKEN", None)  # if HF repo is private
-    try:
-        model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=token)
-        model = k_load_model(model_path, compile=False)
-        return model
-    except Exception as e:
-        st.error(f"Model load failed: {e}")
-        st.stop()
+    model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=token)
+    return k_load_model(model_path, compile=False)
 
 model = load_model()
 
-# ─── Image Preprocessing ────────────────────────────────────────────────────────
+# ─── Image Preprocessing & Prediction ───────────────────────────────────────────
 def preprocess_image(pil: Image.Image) -> np.ndarray:
     pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
     arr = np.asarray(pil, dtype=np.float32)
     return preprocess_input(arr)  # InceptionV3 scaling [-1, 1]
 
-# ─── Prediction ─────────────────────────────────────────────────────────────────
 def classify(pil: Image.Image):
     arr = preprocess_image(pil)
     preds = model.predict(arr[np.newaxis], verbose=0)[0]
     idx = int(np.argmax(preds))
     return STAGE_LABELS[idx], float(preds[idx]), preds
 
-def draw_label(pil: Image.Image, label: str, conf: float) -> Image.Image:
+def draw_label(pil: Image.Image, text: str, fill: str = "red"):
     pil = pil.copy()
     draw = ImageDraw.Draw(pil)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
-
-    text = f"{label} ({conf:.0%})"
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     except Exception:
         w, h = draw.textsize(text, font=font)
-
     padding = 6
     bg_rect = [0 - padding, 0 - padding, w + padding, h + padding]
     draw.rectangle(bg_rect, fill="black")
-    draw.text((0, 0), text, font=font, fill="red")
+    draw.text((0, 0), text, font=font, fill=fill)
     return pil
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
 st.title("Live Drosophila Detection")
 st.subheader("📹 Live Camera Detection with Stable Prediction")
 
-if "stable_prediction" not in st.session_state:
-    st.session_state["stable_prediction"] = "Waiting..."
+# place where we show the stable prediction (main thread only)
+stable_pred_box = st.empty()
 
 # ─── Video Processor ────────────────────────────────────────────────────────────
 class StableProcessor(VideoProcessorBase):
     def __init__(self):
+        # state used only within this worker thread
         self.last_label = None
         self.count = 0
         self.stable_label = None
+        self.stable_conf = 0.0
+
+        # throttle inference (once every 0.3 s)
+        self.last_infer_t = 0.0
+        self.infer_interval_s = 0.3
+
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
@@ -104,28 +95,38 @@ class StableProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
 
-        label, conf, _ = classify(pil)
+        # throttle heavy inference
+        t = time.time()
+        do_infer = (t - self.last_infer_t) >= self.infer_interval_s
+        if do_infer:
+            self.last_infer_t = t
+            label, conf, _ = classify(pil)
 
-        if label == self.last_label:
-            self.count += 1
+            # stability over consecutive inferences (not per-frame)
+            if label == self.last_label:
+                self.count += 1
+            else:
+                self.last_label = label
+                self.count = 1
+
+            if self.count >= 3:
+                self.stable_label = label
+                self.stable_conf = conf
+
+            text = f"{label} ({conf:.0%})"
         else:
-            self.last_label = label
-            self.count = 1
+            # draw last seen label if available
+            text = f"{self.last_label or '…'}"
 
-        if self.count >= 3:
-            self.stable_label = label
-            st.session_state["stable_prediction"] = self.stable_label
-
-        draw = ImageDraw.Draw(pil)
-        text = f"{label} ({conf:.0%})"
+        # overlay current label (not touching session_state here)
         try:
-            bbox = draw.textbbox((0, 0), text, font=self.font)
+            bbox = ImageDraw.Draw(pil).textbbox((0, 0), text, font=self.font)
             w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         except Exception:
-            w, h = draw.textsize(text, font=self.font)
-
+            w, h = ImageDraw.Draw(pil).textsize(text, font=self.font)
         padding = 6
         bg_rect = [0 - padding, 0 - padding, w + padding, h + padding]
+        draw = ImageDraw.Draw(pil)
         draw.rectangle(bg_rect, fill="black")
         draw.text((0, 0), text, font=self.font, fill="red")
 
@@ -136,15 +137,22 @@ webrtc_ctx = webrtc_streamer(
     key="live",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
-    rtc_configuration=RTC_CONFIGURATION,   # <— add this
+    rtc_configuration=RTC_CONFIGURATION,
     video_processor_factory=StableProcessor,
-    async_processing=True
+    async_processing=True,
 )
 
-st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
-st.success(st.session_state.get("stable_prediction", "Waiting..."))
+# Show stable prediction from the main thread without mutating state in recv
+if webrtc_ctx and webrtc_ctx.state.playing:
+    # auto-refresh this small area every 700 ms while playing
+    st.autorefresh(interval=700, key="pred_refresh")
+    vp = webrtc_ctx.video_processor
+    if vp and vp.stable_label:
+        stable_pred_box.success(f"🧠 Stable Prediction: **{vp.stable_label}** ({vp.stable_conf:.2%})")
+    else:
+        stable_pred_box.info("🧠 Stable Prediction: gathering…")
 
-# ─── NEW: Single Image Upload & Classification ──────────────────────────────────
+# ─── Single Image Upload & Classification ───────────────────────────────────────
 st.markdown("---")
 st.header("🖼️ Upload an Image for Classification")
 
@@ -164,13 +172,16 @@ if uploaded is not None:
         st.write(f"**Stage:** {label}")
         st.write(f"**Confidence:** {conf:.2%}")
 
-    annotated = draw_label(pil_in, label, conf)
+    annotated = draw_label(pil_in, f"{label} ({conf:.0%})")
     with col2:
         st.subheader("Annotated Preview")
         st.image(annotated, use_column_width=True)
 
     with st.expander("Show class probabilities"):
-        rows = [(lab, float(p)) for lab, p in zip(STAGE_LABELS, probs)]
-        rows.sort(key=lambda x: x[1], reverse=True)
+        rows = sorted(
+            [(lab, float(p)) for lab, p in zip(STAGE_LABELS, probs)],
+            key=lambda x: x[1],
+            reverse=True,
+        )
         for lab, p in rows:
             st.write(f"{lab}: {p:.2%}")

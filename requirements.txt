@@ -1,5 +1,7 @@
 streamlit==1.38.0
-streamlit-webrtc==0.45.0
+streamlit-webrtc==0.47.6
+aiortc==1.13.0
+pyee==11.1.0
 av==10.0.0
 numpy==1.26.4
 tensorflow==2.16.1

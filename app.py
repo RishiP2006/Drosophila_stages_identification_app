@@ -46,12 +46,35 @@ def classify(pil: Image.Image):
     arr = preprocess_image(pil)
     preds = model.predict(arr[np.newaxis], verbose=0)[0]
     idx = int(np.argmax(preds))
-    return STAGE_LABELS[idx], float(preds[idx])
+    return STAGE_LABELS[idx], float(preds[idx]), preds
+
+def draw_label(pil: Image.Image, label: str, conf: float) -> Image.Image:
+    pil = pil.copy()
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+    except Exception:
+        font = ImageFont.load_default()
+
+    text = f"{label} ({conf:.0%})"
+    # Compute text box (with fallback)
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        w, h = draw.textsize(text, font=font)
+
+    padding = 6
+    bg_rect = [0 - padding, 0 - padding, w + padding, h + padding]
+    draw.rectangle(bg_rect, fill="black")
+    draw.text((0, 0), text, font=font, fill="red")
+    return pil
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
 st.title("Live Drosophila Detection")
 st.subheader("📹 Live Camera Detection with Stable Prediction")
 
+# Session state for stable prediction text
 if "stable_prediction" not in st.session_state:
     st.session_state["stable_prediction"] = "Waiting..."
 
@@ -70,8 +93,9 @@ class StableProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
 
-        label, conf = classify(pil)
+        label, conf, _ = classify(pil)
 
+        # Stability check over consecutive frames
         if label == self.last_label:
             self.count += 1
         else:
@@ -84,14 +108,16 @@ class StableProcessor(VideoProcessorBase):
 
         draw = ImageDraw.Draw(pil)
         text = f"{label} ({conf:.0%})"
+
+        # Compute text box (with fallback)
         try:
             bbox = draw.textbbox((0, 0), text, font=self.font)
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         except Exception:
             w, h = draw.textsize(text, font=self.font)
-            bbox = (0, 0, w, h)
 
         padding = 6
-        bg_rect = [bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding]
+        bg_rect = [0 - padding, 0 - padding, w + padding, h + padding]
         draw.rectangle(bg_rect, fill="black")
         draw.text((0, 0), text, font=self.font, fill="red")
 
@@ -106,6 +132,41 @@ webrtc_ctx = webrtc_streamer(
     async_processing=True
 )
 
-# ─── Display Stable Result ──────────────────────────────────────────────────────
 st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
 st.success(st.session_state.get("stable_prediction", "Waiting..."))
+
+# ─── NEW: Single Image Upload & Classification ──────────────────────────────────
+st.markdown("---")
+st.header("🖼️ Upload an Image for Classification")
+
+uploaded = st.file_uploader(
+    "Upload a Drosophila image (JPG/PNG)",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=False
+)
+
+if uploaded is not None:
+    pil_in = Image.open(uploaded).convert("RGB")
+    label, conf, probs = classify(pil_in)
+
+    # Show prediction
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.subheader("Prediction")
+        st.write(f"**Stage:** {label}")
+        st.write(f"**Confidence:** {conf:.2%}")
+
+    # Show annotated preview
+    annotated = draw_label(pil_in, label, conf)
+    with col2:
+        st.subheader("Annotated Preview")
+        st.image(annotated, use_column_width=True)
+
+    # Optional: show class scores
+    with st.expander("Show class probabilities"):
+        # Build a simple table of label -> probability
+        rows = [(lab, float(p)) for lab, p in zip(STAGE_LABELS, probs)]
+        # Sort descending by probability
+        rows.sort(key=lambda x: x[1], reverse=True)
+        for lab, p in rows:
+            st.write(f"{lab}: {p:.2%}")

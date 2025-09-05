@@ -2,8 +2,12 @@
 import streamlit as st
 st.set_page_config(page_title="Drosophila Stage Identification", layout="centered")
 
+# 🔧 Compat shim: some streamlit-webrtc builds call st.experimental_rerun (removed in newer Streamlit)
+if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
+    st.experimental_rerun = st.rerun  # type: ignore[attr-defined]
+
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, Image
 from huggingface_hub import hf_hub_download
 
 # WebRTC (same simple pattern as your working app)
@@ -18,10 +22,7 @@ from keras.applications.inception_v3 import preprocess_input
 HF_REPO_ID = "RishiPTrial/my-model-name"
 MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
 INPUT_SIZE = 299
-STAGE_LABELS = [
-    "egg", "1st instar", "2nd instar", "3rd instar",
-    "white pupa", "brown pupa", "eye pupa"
-]
+STAGE_LABELS = ["egg", "1st instar", "2nd instar", "3rd instar", "white pupa", "brown pupa", "eye pupa"]
 
 # ─── Load model (cached) ────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
@@ -36,7 +37,7 @@ model = load_stage_model()
 def preprocess_image(pil: Image.Image) -> np.ndarray:
     pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
     arr = np.asarray(pil, dtype=np.float32)
-    return preprocess_input(arr)  # InceptionV3 expects [-1, 1] scaling via preprocess_input
+    return preprocess_input(arr)  # InceptionV3 scaling [-1, 1]
 
 def classify(pil: Image.Image):
     x = preprocess_image(pil)[np.newaxis]
@@ -51,9 +52,9 @@ def annotate(pil: Image.Image, text: str) -> Image.Image:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
-    # text size (with fallback)
     try:
-        bbox = draw.textbbox((0, 0), text, font=font); w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
     except Exception:
         w, h = draw.textsize(text, font=font)
     pad = 6
@@ -62,14 +63,13 @@ def annotate(pil: Image.Image, text: str) -> Image.Image:
     return out
 
 def show_probs(labels, probs):
-    rows = sorted([(lab, float(p)) for lab, p in zip(labels, probs)],
-                  key=lambda x: x[1], reverse=True)
+    rows = sorted([(lab, float(p)) for lab, p in zip(labels, probs)], key=lambda x: x[1], reverse=True)
     for lab, p in rows:
         st.write(f"{lab}: {p:.2%}")
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
 st.title("🪰 Drosophila Stage Identification")
-st.write("Upload an image or use the live camera (same simple WebRTC pattern as your other app).")
+st.write("Upload an image or use the live camera.")
 
 st.markdown("### 📷 Upload Image")
 uploaded = st.file_uploader("Upload a Drosophila image (JPG/PNG)", type=["jpg", "jpeg", "png"])
@@ -93,31 +93,23 @@ st.subheader("📸 Live Camera Stage Detection")
 # ─── Video processor (no Streamlit calls, no session_state mutations) ───────────
 class StageProcessor(VideoProcessorBase):
     def __init__(self):
-        self.font = None
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
             self.font = ImageFont.load_default()
-        self.last_label = None  # optional display continuity
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
-
-        # predict on this frame
         label, conf, _ = classify(pil)
-        self.last_label = label
-
-        # draw overlay
-        text = f"{label} ({conf:.0%})"
-        out = annotate(pil, text)
+        out = annotate(pil, f"{label} ({conf:.0%})")
         return av.VideoFrame.from_ndarray(np.array(out), format="rgb24")
 
-# ─── Start webcam (identical shape to your working app) ─────────────────────────
+# ─── Start webcam (same simple shape as your other working app) ─────────────────
 webrtc_streamer(
     key="live-stage-detect",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
     video_processor_factory=StageProcessor,
-    async_processing=True,  # match your working app
+    async_processing=True,  # matches your working app
 )

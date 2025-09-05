@@ -1,21 +1,25 @@
-# app.py
+# ------------------ app.py ------------------
+# Hard-disable GPU/XLA noise BEFORE any TF/Keras import
 import os
-os.environ.setdefault("KERAS_BACKEND", "tensorflow")  # ensure Keras 3 uses TF backend
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"          # force CPU; avoids cuInit(303)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"           # silence TF INFO/WARN
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
 import streamlit as st
 st.set_page_config(layout="centered")
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from huggingface_hub import hf_hub_download
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
-from huggingface_hub import hf_hub_download
 
-# 👉 Use KERAS 3 (not tf.keras)
+# Prefer tf.keras loader for legacy .h5; fall back to Keras 3 if needed
+from tensorflow.keras.models import load_model as tf_load_model
 from keras.models import load_model as k_load_model
 from keras.applications.inception_v3 import preprocess_input
 
-# ─── Config ─────────────────────────────────────────────────────────────────────
+# ─── Config ────────────────────────────────────────────────────────────────────
 HF_REPO_ID = "RishiPTrial/my-model-name"
 MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
 INPUT_SIZE = 299
@@ -24,39 +28,53 @@ STAGE_LABELS = [
     "white pupa", "brown pupa", "eye pupa"
 ]
 
-# ─── Load Model (Keras 3) ───────────────────────────────────────────────────────
+# ─── Load Model (robust to legacy H5) ──────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_model():
     token = st.secrets.get("HF_TOKEN", None)  # if HF repo is private
     model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=token)
-    model = k_load_model(model_path, compile=False)
-    return model
+
+    # 1) Try tf.keras legacy H5 loader (best chance for old graphs)
+    try:
+        m = tf_load_model(model_path, compile=False)
+        return m
+    except Exception as e_tf:
+        st.warning(f"tf.keras load failed, trying Keras 3 legacy loader…\n{e_tf}")
+
+    # 2) Fall back to Keras 3 H5 loader
+    try:
+        m = k_load_model(model_path, compile=False)
+        return m
+    except Exception as e_k:
+        st.error(
+            "Model load failed with both loaders.\n\n"
+            f"tf.keras error:\n{e_tf}\n\nKeras 3 error:\n{e_k}\n\n"
+            "Tip: Load once locally with tf.keras and re-save as .keras or SavedModel."
+        )
+        st.stop()
 
 model = load_model()
 
-# ─── Image Preprocessing ────────────────────────────────────────────────────────
+# ─── Image Preprocessing ───────────────────────────────────────────────────────
 def preprocess_image(pil: Image.Image) -> np.ndarray:
     pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
     arr = np.asarray(pil, dtype=np.float32)
-    return preprocess_input(arr)  # InceptionV3 scaling [-1, 1]
+    return preprocess_input(arr)  # InceptionV3 expects [-1, 1]
 
-# ─── Prediction ─────────────────────────────────────────────────────────────────
+# ─── Prediction ────────────────────────────────────────────────────────────────
 def classify(pil: Image.Image):
     arr = preprocess_image(pil)
     preds = model.predict(arr[np.newaxis], verbose=0)[0]
     idx = int(np.argmax(preds))
     return STAGE_LABELS[idx], float(preds[idx])
 
-# ─── UI ─────────────────────────────────────────────────────────────────────────
+# ─── UI ────────────────────────────────────────────────────────────────────────
 st.title("Live Drosophila Detection")
-st.caption("If camera doesn’t start, try Chrome on desktop/macOS. A snapshot fallback is provided below.")
+st.caption("Live per-frame predictions. If the camera fails to connect, use the snapshot fallback below.")
 
-# ─── Video Processor ────────────────────────────────────────────────────────────
-class StableProcessor(VideoProcessorBase):
+# ─── Video Processor (no stability; per-frame inference) ───────────────────────
+class SimpleProcessor(VideoProcessorBase):
     def __init__(self):
-        self.last_label = None
-        self.count = 0
-        self.stable_label = "Waiting..."
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
@@ -66,61 +84,43 @@ class StableProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
 
-        # Run classifier (guarded)
+        # Inference (per frame)
         try:
             label, conf = classify(pil)
         except Exception:
             label, conf = "error", 0.0
 
-        # Stability over 3 consecutive frames
-        if label == self.last_label:
-            self.count += 1
-        else:
-            self.last_label = label
-            self.count = 1
-        if self.count >= 3:
-            self.stable_label = label
-
         # Draw overlay
         draw = ImageDraw.Draw(pil)
         text = f"{label} ({conf:.0%})"
-
         try:
-            bbox = draw.textbbox((0, 0), text, font=self.font)
-            x0, y0, x1, y1 = bbox
+            x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=self.font)
         except Exception:
             w, h = draw.textsize(text, font=self.font)
             x0, y0, x1, y1 = 0, 0, w, h
-
-        padding = 6
-        draw.rectangle([x0 - padding, y0 - padding, x1 + padding, y1 + padding], fill="black")
+        pad = 6
+        draw.rectangle([x0 - pad, y0 - pad, x1 + pad, y1 + pad], fill="black")
         draw.text((0, 0), text, font=self.font, fill="red")
 
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-# ─── Start Webcam (No STUN to avoid UDP/ICE retries) ────────────────────────────
-rtc_cfg = {"iceServers": []}  # host candidates only; great for localhost/LAN
-webrtc_ctx = webrtc_streamer(
+# ─── Start Webcam (host-only ICE to avoid STUN/UDP retries) ───────────────────
+rtc_cfg = {"iceServers": []}  # good for localhost/LAN; use TURN for internet
+webrtc_streamer(
     key="live",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
-    video_processor_factory=StableProcessor,
-    async_processing=False,                 # avoid event-loop/thread races
+    video_processor_factory=SimpleProcessor,
+    async_processing=False,          # avoid event-loop/thread races
     rtc_configuration=rtc_cfg
 )
 
-# ─── Display Stable Result ──────────────────────────────────────────────────────
-st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
-if webrtc_ctx and webrtc_ctx.video_processor:
-    st.success(webrtc_ctx.video_processor.stable_label)
-else:
-    st.info("Waiting for camera permission…")
-
-# ─── Snapshot fallback (works even if WebRTC is blocked) ────────────────────────
+# ─── Snapshot fallback (works if WebRTC is blocked) ────────────────────────────
 st.divider()
 snap = st.camera_input("No luck with live video? Use the snapshot fallback:")
 if snap is not None:
     pil = Image.open(snap)
     label, conf = classify(pil)
     st.success(f"{label} ({conf:.0%})")
-    st.image(pil, caption="Snapshot")
+    st.image(pil, caption="Snapshot prediction")
+# ---------------- End app.py ---------------

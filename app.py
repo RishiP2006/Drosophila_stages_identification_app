@@ -1,43 +1,67 @@
 # app.py
+import io, time, uuid
 import streamlit as st
 st.set_page_config(page_title="Drosophila Stage Identification", layout="centered")
 
-# 🔧 Compat shim: some streamlit-webrtc builds call st.experimental_rerun (removed in newer Streamlit)
+# Shim for older streamlit-webrtc (some builds call st.experimental_rerun)
 if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
-    st.experimental_rerun = st.rerun  # type: ignore[attr-defined]
+    st.experimental_rerun = st.rerun  # type: ignore
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, Image
+from PIL import Image, ImageDraw, ImageFont
 from huggingface_hub import hf_hub_download
 
-# WebRTC (same simple pattern as your working app)
+# WebRTC
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 
-# Keras 3 runtime
+# Keras 3
 from keras.models import load_model as k_load_model
 from keras.applications.inception_v3 import preprocess_input
 
-# ─── App config ─────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────────
 HF_REPO_ID = "RishiPTrial/my-model-name"
 MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
 INPUT_SIZE = 299
-STAGE_LABELS = ["egg", "1st instar", "2nd instar", "3rd instar", "white pupa", "brown pupa", "eye pupa"]
+STAGE_LABELS = ["egg","1st instar","2nd instar","3rd instar","white pupa","brown pupa","eye pupa"]
 
-# ─── Load model (cached) ────────────────────────────────────────────────────────
+# Force TURN relay over TCP 443 (bypass strict NAT/firewalls)
+# If you have your own TURN, put creds in st.secrets as TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL
+TURN_URLS = st.secrets.get("TURN_URLS", [
+    "turn:openrelay.metered.ca:80",
+    "turn:openrelay.metered.ca:443",
+    "turn:openrelay.metered.ca:443?transport=tcp",
+])
+TURN_USERNAME = st.secrets.get("TURN_USERNAME", "openrelayproject")
+TURN_CREDENTIAL = st.secrets.get("TURN_CREDENTIAL", "openrelayproject")
+RTC_CONFIGURATION = {
+    "iceServers": [{"urls": TURN_URLS, "username": TURN_USERNAME, "credential": TURN_CREDENTIAL}],
+    "iceTransportPolicy": "relay",  # <— RELAY ONLY (no STUN/P2P)
+}
+
+MEDIA_STREAM_CONSTRAINTS = {
+    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15}},
+    "audio": False,
+}
+
+# Stable component key so the peer connection isn’t torn down by reruns
+if "webrtc_key" not in st.session_state:
+    st.session_state["webrtc_key"] = f"live-{uuid.uuid4().hex}"
+
+# ── Model ───────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
-def load_stage_model():
+def load_model():
     token = st.secrets.get("HF_TOKEN", None)
     path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=token)
     return k_load_model(path, compile=False)
 
-model = load_stage_model()
+model = load_model()
 
-# ─── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────
 def preprocess_image(pil: Image.Image) -> np.ndarray:
     pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
     arr = np.asarray(pil, dtype=np.float32)
-    return preprocess_input(arr)  # InceptionV3 scaling [-1, 1]
+    return preprocess_input(arr)
 
 def classify(pil: Image.Image):
     x = preprocess_image(pil)[np.newaxis]
@@ -47,34 +71,29 @@ def classify(pil: Image.Image):
 
 def annotate(pil: Image.Image, text: str) -> Image.Image:
     out = pil.copy()
-    draw = ImageDraw.Draw(out)
+    d = ImageDraw.Draw(out)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
     try:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+        bbox = d.textbbox((0, 0), text, font=font); w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
     except Exception:
-        w, h = draw.textsize(text, font=font)
+        w, h = d.textsize(text, font=font)
     pad = 6
-    draw.rectangle([0-pad, 0-pad, w+pad, h+pad], fill="black")
-    draw.text((0, 0), text, font=font, fill="red")
+    d.rectangle([0-pad, 0-pad, w+pad, h+pad], fill="black")
+    d.text((0, 0), text, font=font, fill="red")
     return out
 
-def show_probs(labels, probs):
-    rows = sorted([(lab, float(p)) for lab, p in zip(labels, probs)], key=lambda x: x[1], reverse=True)
-    for lab, p in rows:
-        st.write(f"{lab}: {p:.2%}")
-
-# ─── UI ─────────────────────────────────────────────────────────────────────────
+# ── UI ──────────────────────────────────────────────────────────────────────────
 st.title("🪰 Drosophila Stage Identification")
-st.write("Upload an image or use the live camera.")
+st.caption("Live video uses TURN relay on TCP:443. If it still buffers, your network blocks relay traffic.")
 
+# Upload (kept)
 st.markdown("### 📷 Upload Image")
-uploaded = st.file_uploader("Upload a Drosophila image (JPG/PNG)", type=["jpg", "jpeg", "png"])
-if uploaded:
-    pil = Image.open(uploaded).convert("RGB")
+up = st.file_uploader("Upload a Drosophila image (JPG/PNG)", type=["jpg","jpeg","png"])
+if up:
+    pil = Image.open(up).convert("RGB")
     label, conf, probs = classify(pil)
     c1, c2 = st.columns(2)
     with c1:
@@ -82,7 +101,8 @@ if uploaded:
         st.write(f"**Stage:** {label}")
         st.write(f"**Confidence:** {conf:.2%}")
         with st.expander("Class probabilities"):
-            show_probs(STAGE_LABELS, probs)
+            for lab, p in sorted(zip(STAGE_LABELS, probs), key=lambda z: z[1], reverse=True):
+                st.write(f"{lab}: {float(p):.2%}")
     with c2:
         st.subheader("Annotated")
         st.image(annotate(pil, f"{label} ({conf:.0%})"), use_column_width=True)
@@ -90,26 +110,47 @@ if uploaded:
 st.markdown("---")
 st.subheader("📸 Live Camera Stage Detection")
 
-# ─── Video processor (no Streamlit calls, no session_state mutations) ───────────
+# ── Video processor (NO Streamlit calls here) ───────────────────────────────────
 class StageProcessor(VideoProcessorBase):
     def __init__(self):
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
             self.font = ImageFont.load_default()
+        self.last_infer_t = 0.0
+        self.infer_interval_s = 0.35  # small throttle to reduce load
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
-        label, conf, _ = classify(pil)
-        out = annotate(pil, f"{label} ({conf:.0%})")
+        now = time.time()
+        text = "…"
+        if now - self.last_infer_t >= self.infer_interval_s:
+            self.last_infer_t = now
+            label, conf, _ = classify(pil)
+            text = f"{label} ({conf:.0%})"
+        out = annotate(pil, text)
         return av.VideoFrame.from_ndarray(np.array(out), format="rgb24")
 
-# ─── Start webcam (same simple shape as your other working app) ─────────────────
+# ── Start WebRTC (relay-only, sync processing, stable key) ──────────────────────
 webrtc_streamer(
-    key="live-stage-detect",
-    mode=WebRtcMode.SENDRECV,
-    media_stream_constraints={"video": True, "audio": False},
+    key=st.session_state["webrtc_key"],
+    mode=WebRtcMode.SENDRECV,  # (client → server video; SENDONLY also works in practice)
+    media_stream_constraints=MEDIA_STREAM_CONSTRAINTS,
+    rtc_configuration=RTC_CONFIGURATION,    # <— TURN relay only
     video_processor_factory=StageProcessor,
-    async_processing=True,  # matches your working app
+    async_processing=False,                 # fewer async races on Cloud
+    sendback_audio=False,
+    video_html_attrs={"autoPlay": True, "playsinline": True, "muted": True},
 )
+
+# Versions (helps verify the deployed stack)
+with st.sidebar:
+    try:
+        import streamlit_webrtc as stw, aiortc, av as _av, pyee
+        st.write("webrtc:", stw.__version__)
+        st.write("aiortc:", aiortc.__version__)
+        st.write("av:", _av.__version__)
+        st.write("pyee:", pyee.__version__)
+    except Exception:
+        st.write("webrtc stack: n/a")

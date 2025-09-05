@@ -1,8 +1,12 @@
+# Force pip to install the prebuilt wheel for streamlit_webrtc (includes the frontend JS)
+--only-binary=streamlit_webrtc
+--no-cache-dir
+
 streamlit==1.38.0
-streamlit-webrtc==0.47.6
-aiortc==1.13.0
-av==14.0.1
-# (let aiortc pull a compatible pyee automatically; do NOT pin pyee to 11.x)
+streamlit-webrtc==0.47.6       # known-good with bundled frontend
+aiortc==1.13.0                 # matches 0.47.x
+av==14.0.1                     # aiortc 1.13 needs av >=14,<15
+# let aiortc pick a compatible pyee automatically (DO NOT pin pyee to 11.x)
 numpy==1.26.4
 tensorflow==2.16.1
 keras==3.3.3

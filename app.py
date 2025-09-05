@@ -1,9 +1,8 @@
 # app.py
-import io, time, uuid
 import streamlit as st
 st.set_page_config(page_title="Drosophila Stage Identification", layout="centered")
 
-# Compat: some streamlit-webrtc builds call st.experimental_rerun
+# Shim: some streamlit-webrtc builds call st.experimental_rerun
 if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
     st.experimental_rerun = st.rerun  # type: ignore
 
@@ -11,7 +10,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from huggingface_hub import hf_hub_download
 
-# WebRTC
+# WebRTC — keep it minimal (like your working app)
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av
 
@@ -24,26 +23,6 @@ HF_REPO_ID = "RishiPTrial/my-model-name"
 MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
 INPUT_SIZE = 299
 STAGE_LABELS = ["egg","1st instar","2nd instar","3rd instar","white pupa","brown pupa","eye pupa"]
-
-# TURN relay over TCP:443 only (bypass strict NAT)
-TURN_URLS = [
-    "turn:openrelay.metered.ca:443?transport=tcp",
-    "turn:openrelay.metered.ca:443",
-    "turn:openrelay.metered.ca:80",
-]
-RTC_CONFIGURATION = {
-    "iceServers": [{"urls": TURN_URLS, "username": "openrelayproject", "credential": "openrelayproject"}],
-    "iceTransportPolicy": "relay",
-}
-
-MEDIA_STREAM_CONSTRAINTS = {
-    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15}},
-    "audio": False,
-}
-
-# Stable key so the PeerConnection isn’t recreated by reruns
-if "webrtc_key" not in st.session_state:
-    st.session_state["webrtc_key"] = f"live-{uuid.uuid4().hex}"
 
 # ── Model ───────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
@@ -82,6 +61,11 @@ def annotate(pil: Image.Image, text: str) -> Image.Image:
     d.text((0, 0), text, font=font, fill="red")
     return out
 
+def show_probs(labels, probs):
+    rows = sorted([(lab, float(p)) for lab, p in zip(labels, probs)], key=lambda x: x[1], reverse=True)
+    for lab, p in rows:
+        st.write(f"{lab}: {p:.2%}")
+
 # ── UI ──────────────────────────────────────────────────────────────────────────
 st.title("🪰 Drosophila Stage Identification")
 
@@ -96,8 +80,7 @@ if up:
         st.write(f"**Stage:** {label}")
         st.write(f"**Confidence:** {conf:.2%}")
         with st.expander("Class probabilities"):
-            for lab, p in sorted(zip(STAGE_LABELS, probs), key=lambda z: z[1], reverse=True):
-                st.write(f"{lab}: {float(p):.2%}")
+            show_probs(STAGE_LABELS, probs)
     with c2:
         st.subheader("Annotated")
         st.image(annotate(pil, f"{label} ({conf:.0%})"), use_column_width=True)
@@ -105,46 +88,31 @@ if up:
 st.markdown("---")
 st.subheader("📸 Live Camera Stage Detection")
 
-# ── Video processor (NO Streamlit calls here) ───────────────────────────────────
+# Video processor — no Streamlit calls, no session writes
 class StageProcessor(VideoProcessorBase):
     def __init__(self):
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
             self.font = ImageFont.load_default()
-        self.last_infer_t = 0.0
-        self.infer_interval_s = 0.35
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="rgb24")
-        pil = Image.fromarray(img)
-        now = time.time()
-        text = "…"
-        if now - self.last_infer_t >= self.infer_interval_s:
-            self.last_infer_t = now
+        try:
+            img = frame.to_ndarray(format="rgb24")
+            pil = Image.fromarray(img)
             label, conf, _ = classify(pil)
-            text = f"{label} ({conf:.0%})"
-        out = annotate(pil, text)
-        return av.VideoFrame.from_ndarray(np.array(out), format="rgb24")
+            out = annotate(pil, f"{label} ({conf:.0%})")
+            return av.VideoFrame.from_ndarray(np.array(out), format="rgb24")
+        except Exception as e:
+            # Never crash the video loop — draw the error on the frame
+            pil = Image.fromarray(frame.to_ndarray(format="rgb24"))
+            return av.VideoFrame.from_ndarray(np.array(annotate(pil, f"ERR: {e}")), format="rgb24")
 
-# ── Start WebRTC (relay-only, sync processing, stable key) ──────────────────────
+# Start webcam — identical shape to your working app
 webrtc_streamer(
-    key=st.session_state["webrtc_key"],
+    key="live-stage-detect",
     mode=WebRtcMode.SENDRECV,
-    media_stream_constraints=MEDIA_STREAM_CONSTRAINTS,
-    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"video": True, "audio": False},
     video_processor_factory=StageProcessor,
-    async_processing=False,     # fewer races on Cloud
-    sendback_audio=False,
-    video_html_attrs={"autoPlay": True, "playsinline": True, "muted": True},
+    async_processing=True,  # match the working app
 )
-
-# Show versions so you can confirm the right wheels are actually installed
-with st.sidebar:
-    try:
-        import streamlit_webrtc as stw, aiortc, av as _av
-        st.write("webrtc:", stw.__version__)
-        st.write("aiortc:", aiortc.__version__)
-        st.write("av:", _av.__version__)
-    except Exception:
-        st.write("webrtc stack: n/a")

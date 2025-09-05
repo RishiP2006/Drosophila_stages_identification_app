@@ -1,4 +1,7 @@
 # app.py
+import os
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")  # ensure Keras 3 uses TF backend
+
 import streamlit as st
 st.set_page_config(layout="centered")
 
@@ -25,13 +28,9 @@ STAGE_LABELS = [
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_model():
     token = st.secrets.get("HF_TOKEN", None)  # if HF repo is private
-    try:
-        model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=token)
-        model = k_load_model(model_path, compile=False)
-        return model
-    except Exception as e:
-        st.error(f"Model load failed: {e}")
-        st.stop()
+    model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=token)
+    model = k_load_model(model_path, compile=False)
+    return model
 
 model = load_model()
 
@@ -50,17 +49,14 @@ def classify(pil: Image.Image):
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
 st.title("Live Drosophila Detection")
-st.subheader("📹 Live Camera Detection with Stable Prediction")
-
-if "stable_prediction" not in st.session_state:
-    st.session_state["stable_prediction"] = "Waiting..."
+st.caption("If camera doesn’t start, try Chrome on desktop/macOS. A snapshot fallback is provided below.")
 
 # ─── Video Processor ────────────────────────────────────────────────────────────
 class StableProcessor(VideoProcessorBase):
     def __init__(self):
         self.last_label = None
         self.count = 0
-        self.stable_label = None
+        self.stable_label = "Waiting..."
         try:
             self.font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
@@ -70,42 +66,61 @@ class StableProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="rgb24")
         pil = Image.fromarray(img)
 
-        label, conf = classify(pil)
+        # Run classifier (guarded)
+        try:
+            label, conf = classify(pil)
+        except Exception:
+            label, conf = "error", 0.0
 
+        # Stability over 3 consecutive frames
         if label == self.last_label:
             self.count += 1
         else:
             self.last_label = label
             self.count = 1
-
         if self.count >= 3:
             self.stable_label = label
-            st.session_state["stable_prediction"] = self.stable_label
 
+        # Draw overlay
         draw = ImageDraw.Draw(pil)
         text = f"{label} ({conf:.0%})"
+
         try:
             bbox = draw.textbbox((0, 0), text, font=self.font)
+            x0, y0, x1, y1 = bbox
         except Exception:
             w, h = draw.textsize(text, font=self.font)
-            bbox = (0, 0, w, h)
+            x0, y0, x1, y1 = 0, 0, w, h
 
         padding = 6
-        bg_rect = [bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding]
-        draw.rectangle(bg_rect, fill="black")
+        draw.rectangle([x0 - padding, y0 - padding, x1 + padding, y1 + padding], fill="black")
         draw.text((0, 0), text, font=self.font, fill="red")
 
         return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
 
-# ─── Start Webcam ───────────────────────────────────────────────────────────────
+# ─── Start Webcam (No STUN to avoid UDP/ICE retries) ────────────────────────────
+rtc_cfg = {"iceServers": []}  # host candidates only; great for localhost/LAN
 webrtc_ctx = webrtc_streamer(
     key="live",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": True, "audio": False},
     video_processor_factory=StableProcessor,
-    async_processing=True
+    async_processing=False,                 # avoid event-loop/thread races
+    rtc_configuration=rtc_cfg
 )
 
 # ─── Display Stable Result ──────────────────────────────────────────────────────
 st.markdown("### 🧠 Stable Prediction (after 3 consistent frames):")
-st.success(st.session_state.get("stable_prediction", "Waiting..."))
+if webrtc_ctx and webrtc_ctx.video_processor:
+    st.success(webrtc_ctx.video_processor.stable_label)
+else:
+    st.info("Waiting for camera permission…")
+
+# ─── Snapshot fallback (works even if WebRTC is blocked) ────────────────────────
+st.divider()
+snap = st.camera_input("No luck with live video? Use the snapshot fallback:")
+if snap is not None:
+    pil = Image.open(snap)
+    label, conf = classify(pil)
+    st.success(f"{label} ({conf:.0%})")
+    st.image(pil, caption="Snapshot")

@@ -1,11 +1,19 @@
+# Core
 streamlit==1.38.0
-streamlit-webrtc==0.45.0
-aiortc==1.5.0
-av==10.0.0
-pyee==9.0.4
+
+# Use a recent wheel so the frontend JS is packaged correctly
+streamlit-webrtc==0.63.4
+
+# WebRTC stack (let the resolver pick compatible pyee)
+aiortc==1.13.0
+av==14.0.1
+
+# ML stack (Keras 3 + TF 2.16 works well for inference on CPU)
 numpy==1.26.4
 tensorflow==2.16.1
 keras==3.3.3
-huggingface_hub==0.24.6
-Pillow==10.4.0
 h5py==3.11.0
+Pillow==10.4.0
+
+# HF
+huggingface_hub==0.24.6

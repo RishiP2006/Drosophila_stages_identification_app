@@ -3,7 +3,7 @@ import io, time, uuid
 import streamlit as st
 st.set_page_config(page_title="Drosophila Stage Identification", layout="centered")
 
-# Shim for older streamlit-webrtc (some builds call st.experimental_rerun)
+# Compat: some streamlit-webrtc builds call st.experimental_rerun
 if not hasattr(st, "experimental_rerun") and hasattr(st, "rerun"):
     st.experimental_rerun = st.rerun  # type: ignore
 
@@ -25,18 +25,15 @@ MODEL_FILE = "drosophila_inceptionv3_classifier.h5"
 INPUT_SIZE = 299
 STAGE_LABELS = ["egg","1st instar","2nd instar","3rd instar","white pupa","brown pupa","eye pupa"]
 
-# Force TURN relay over TCP 443 (bypass strict NAT/firewalls)
-# If you have your own TURN, put creds in st.secrets as TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL
-TURN_URLS = st.secrets.get("TURN_URLS", [
-    "turn:openrelay.metered.ca:80",
-    "turn:openrelay.metered.ca:443",
+# TURN relay over TCP:443 only (bypass strict NAT)
+TURN_URLS = [
     "turn:openrelay.metered.ca:443?transport=tcp",
-])
-TURN_USERNAME = st.secrets.get("TURN_USERNAME", "openrelayproject")
-TURN_CREDENTIAL = st.secrets.get("TURN_CREDENTIAL", "openrelayproject")
+    "turn:openrelay.metered.ca:443",
+    "turn:openrelay.metered.ca:80",
+]
 RTC_CONFIGURATION = {
-    "iceServers": [{"urls": TURN_URLS, "username": TURN_USERNAME, "credential": TURN_CREDENTIAL}],
-    "iceTransportPolicy": "relay",  # <— RELAY ONLY (no STUN/P2P)
+    "iceServers": [{"urls": TURN_URLS, "username": "openrelayproject", "credential": "openrelayproject"}],
+    "iceTransportPolicy": "relay",
 }
 
 MEDIA_STREAM_CONSTRAINTS = {
@@ -44,7 +41,7 @@ MEDIA_STREAM_CONSTRAINTS = {
     "audio": False,
 }
 
-# Stable component key so the peer connection isn’t torn down by reruns
+# Stable key so the PeerConnection isn’t recreated by reruns
 if "webrtc_key" not in st.session_state:
     st.session_state["webrtc_key"] = f"live-{uuid.uuid4().hex}"
 
@@ -87,9 +84,7 @@ def annotate(pil: Image.Image, text: str) -> Image.Image:
 
 # ── UI ──────────────────────────────────────────────────────────────────────────
 st.title("🪰 Drosophila Stage Identification")
-st.caption("Live video uses TURN relay on TCP:443. If it still buffers, your network blocks relay traffic.")
 
-# Upload (kept)
 st.markdown("### 📷 Upload Image")
 up = st.file_uploader("Upload a Drosophila image (JPG/PNG)", type=["jpg","jpeg","png"])
 if up:
@@ -118,7 +113,7 @@ class StageProcessor(VideoProcessorBase):
         except Exception:
             self.font = ImageFont.load_default()
         self.last_infer_t = 0.0
-        self.infer_interval_s = 0.35  # small throttle to reduce load
+        self.infer_interval_s = 0.35
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="rgb24")
@@ -135,22 +130,21 @@ class StageProcessor(VideoProcessorBase):
 # ── Start WebRTC (relay-only, sync processing, stable key) ──────────────────────
 webrtc_streamer(
     key=st.session_state["webrtc_key"],
-    mode=WebRtcMode.SENDRECV,  # (client → server video; SENDONLY also works in practice)
+    mode=WebRtcMode.SENDRECV,
     media_stream_constraints=MEDIA_STREAM_CONSTRAINTS,
-    rtc_configuration=RTC_CONFIGURATION,    # <— TURN relay only
+    rtc_configuration=RTC_CONFIGURATION,
     video_processor_factory=StageProcessor,
-    async_processing=False,                 # fewer async races on Cloud
+    async_processing=False,     # fewer races on Cloud
     sendback_audio=False,
     video_html_attrs={"autoPlay": True, "playsinline": True, "muted": True},
 )
 
-# Versions (helps verify the deployed stack)
+# Show versions so you can confirm the right wheels are actually installed
 with st.sidebar:
     try:
-        import streamlit_webrtc as stw, aiortc, av as _av, pyee
+        import streamlit_webrtc as stw, aiortc, av as _av
         st.write("webrtc:", stw.__version__)
         st.write("aiortc:", aiortc.__version__)
         st.write("av:", _av.__version__)
-        st.write("pyee:", pyee.__version__)
     except Exception:
         st.write("webrtc stack: n/a")

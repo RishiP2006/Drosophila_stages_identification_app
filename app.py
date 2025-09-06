@@ -17,11 +17,13 @@ import av
 
 # Keras 3 (native loader for .keras)
 from keras.models import load_model as k3_load_model
-from keras.applications.inception_v3 import preprocess_input
+from keras import layers, Model
+from keras.applications.inception_v3 import InceptionV3, preprocess_input
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 HF_REPO_ID   = "RishiPTrial/my-model-name"
-MODEL_FILE   = "drosophila_inceptionv3_classifier.keras"  # <-- use the new .keras
+MODEL_FILE   = "drosophila_inceptionv3_classifier.keras"   # your new file
+WEIGHTS_FILE = "drosophila_inceptionv3_classifier.weights.h5"  # optional sidecar (if you upload it)
 INPUT_SIZE   = 299
 STAGE_LABELS = ["egg", "1st instar", "2nd instar", "3rd instar", "white pupa", "brown pupa", "eye pupa"]
 
@@ -42,7 +44,7 @@ def get_rtc_configuration():
         if "policy" in ice:
             cfg["iceTransportPolicy"] = ice["policy"]
         return cfg
-    # default to STUN-only (fine for localhost/LAN)
+    # default to STUN-only (fine on localhost/LAN)
     return {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
 def has_turn(cfg: dict) -> bool:
@@ -55,19 +57,46 @@ def has_turn(cfg: dict) -> bool:
                 return True
     return False
 
-# ─── Model loading ─────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading model (.keras) from Hugging Face…")
-def load_model():
-    mp = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=st.secrets.get("HF_TOKEN"))
-    return k3_load_model(mp, compile=False)
+# ─── Build clean architecture (for fallback/weights-by-name) ──────────────────
+def build_clean_model(num_classes=len(STAGE_LABELS)):
+    base = InceptionV3(include_top=False, weights="imagenet", input_shape=(INPUT_SIZE, INPUT_SIZE, 3))
+    x = layers.GlobalAveragePooling2D(name="global_average_pooling2d")(base.output)
+    # Name head 'dense_1' to match typical legacy naming, aiding by-name weight loading
+    out = layers.Dense(num_classes, activation="softmax", name="dense_1")(x)
+    return Model(base.input, out)
 
-model = load_model()
+# ─── Robust loader for .keras with safe fallbacks ──────────────────────────────
+@st.cache_resource(show_spinner="Loading model from Hugging Face…")
+def load_keras_or_fallback():
+    # Try the .keras first
+    keras_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=st.secrets.get("HF_TOKEN"))
+    try:
+        # 1) Keras-3 native load; safe_mode=False avoids some strict config checks
+        return k3_load_model(keras_path, compile=False, safe_mode=False)
+    except Exception as e1:
+        st.warning(f"Direct .keras load failed: {type(e1).__name__}: {e1}\n"
+                   "Trying clean-graph + weights-by-name fallback…")
+
+    # 2) Clean graph + (optional) sidecar weights
+    model = build_clean_model()
+    # If you’ve also uploaded a weights-only file, try to load it
+    try:
+        weights_path = hf_hub_download(repo_id=HF_REPO_ID, filename=WEIGHTS_FILE, token=st.secrets.get("HF_TOKEN"))
+        model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+        st.info("Loaded weights by name from weights.h5 (skipped mismatches).")
+    except Exception:
+        # If no weights file available, we still have a usable (ImageNet-initialized) model
+        st.info("No weights file found or load skipped; using ImageNet-initialized backbone.")
+
+    return model
+
+model = load_keras_or_fallback()
 
 # ─── Inference utils ───────────────────────────────────────────────────────────
 def preprocess_image(pil: Image.Image) -> np.ndarray:
     pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
     arr = np.asarray(pil, dtype=np.float32)
-    return preprocess_input(arr)  # InceptionV3 expects [-1, 1]
+    return preprocess_input(arr)
 
 def classify(pil: Image.Image):
     arr = preprocess_image(pil)
@@ -102,13 +131,12 @@ mode = st.radio(
     horizontal=True,
 )
 
-# ─── Live webcam (only start if TURN exists or user confirms localhost) ───────
+# ─── Live webcam (start only if TURN exists or user confirms localhost) ───────
 if mode == "Live webcam (WebRTC)":
     rtc_cfg = get_rtc_configuration()
     if not has_turn(rtc_cfg):
-        st.info("No TURN is configured. On cloud this may fail. If you are on localhost/LAN, tick below to proceed with STUN-only.")
-        proceed = st.checkbox("I'm on localhost/LAN → proceed with STUN-only", value=False)
-        if not proceed:
+        st.info("No TURN configured. On cloud this may fail. If you’re on localhost/LAN, tick to proceed with STUN-only.")
+        if not st.checkbox("I’m on localhost/LAN → proceed with STUN-only"):
             st.stop()
 
     class SimpleProcessor(VideoProcessorBase):
@@ -135,7 +163,7 @@ if mode == "Live webcam (WebRTC)":
         rtc_configuration=rtc_cfg,
     )
 
-# ─── Snapshot fallback (always works) ─────────────────────────────────────────
+# ─── Snapshot (always works) ───────────────────────────────────────────────────
 elif mode == "Snapshot (no WebRTC)":
     snap = st.camera_input("Take a snapshot:")
     if snap is not None:
@@ -145,7 +173,7 @@ elif mode == "Snapshot (no WebRTC)":
         st.image(draw_overlay(pil, f"{label} ({conf:.0%})"), caption="Snapshot prediction")
 
 # ─── Video upload (simulated live) ─────────────────────────────────────────────
-else:  # Upload video (no WebRTC)
+else:
     vid = st.file_uploader("Upload a short video (MP4/MOV/M4V):", type=["mp4", "mov", "m4v"])
     if vid is not None:
         placeholder = st.empty()

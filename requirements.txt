@@ -4,15 +4,13 @@ streamlit-webrtc==0.47.6
 
 # --- WebRTC / media ---
 aiortc==1.7.0
-av==10.0.0          # pin: newer AV builds can break aiortc
+av==10.0.0
 
-# --- ML stack (CPU) ---
-tensorflow==2.15.0.post1
+# --- ML stack (Keras 3 + TF backend) ---
+tensorflow==2.16.1
 keras==3.3.3
-numpy==1.26.4       # pin: TF 2.15 is not compatible with numpy 2.x
+numpy==1.26.4
 Pillow==10.4.0
 huggingface_hub==0.24.6
-typing_extensions==4.12.2  # small helper; avoids edge cases
-
-# Optional but harmless:
-protobuf==4.25.3    # stays in a TF-friendly range
+typing_extensions==4.12.2
+protobuf==4.25.3

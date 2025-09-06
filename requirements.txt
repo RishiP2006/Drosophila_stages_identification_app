@@ -1,16 +1,9 @@
-# --- Core app ---
-streamlit==1.35.0
-streamlit-webrtc==0.47.6
-
-# --- WebRTC / media ---
-aiortc==1.7.0
-av==10.0.0
-
-# --- ML stack (Keras 3 + TF backend) ---
-tensorflow==2.16.1
-keras==3.3.3
-numpy==1.26.4
-Pillow==10.4.0
-huggingface_hub==0.24.6
-typing_extensions==4.12.2
-protobuf==4.25.3
+streamlit>=1.33
+streamlit-webrtc>=0.47
+huggingface_hub>=0.23
+opencv-python-headless>=4.9.0
+av>=10.0.0
+tensorflow==2.15.1
+numpy>=1.26
+pillow>=10.0.0
+h5py>=3.10.0

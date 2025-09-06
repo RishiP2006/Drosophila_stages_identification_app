@@ -1,189 +1,263 @@
-# ------------------ app.py ------------------
-# Force CPU + quiet TF logs BEFORE any TF/Keras import
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ.setdefault("KERAS_BACKEND", "tensorflow")
-
-import streamlit as st
-st.set_page_config(layout="centered")
-
 import time
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from huggingface_hub import hf_hub_download
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
+
 import av
+import cv2
+import numpy as np
+import streamlit as st
+from huggingface_hub import HfApi, hf_hub_download
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
-# Keras 3 (native loader for .keras)
-from keras.models import load_model as k3_load_model
-from keras import layers, Model
-from keras.applications.inception_v3 import InceptionV3, preprocess_input
+# Use tf.keras only (do NOT pip-install standalone 'keras' to avoid version conflicts on Streamlit Cloud)
+import tensorflow as tf
 
-# ─── Config ────────────────────────────────────────────────────────────────────
-HF_REPO_ID   = "RishiPTrial/my-model-name"
-MODEL_FILE   = "drosophila_inceptionv3_classifier.keras"   # your new file
-WEIGHTS_FILE = "drosophila_inceptionv3_classifier.weights.h5"  # optional sidecar (if you upload it)
-INPUT_SIZE   = 299
-STAGE_LABELS = ["egg", "1st instar", "2nd instar", "3rd instar", "white pupa", "brown pupa", "eye pupa"]
+# ----------------------------
+# Basic App Config
+# ----------------------------
+st.set_page_config(page_title="Drosophila Stage Live Classifier", layout="wide")
+st.title("🪰 Drosophila Stage — Live Video Classifier")
 
-# ─── ICE / TURN helpers ────────────────────────────────────────────────────────
-def get_rtc_configuration():
-    """
-    For cloud use, add TURN creds in .streamlit/secrets.toml:
-      [ice]
-      policy = "relay"
-      servers = [
-        {urls = ["stun:stun.l.google.com:19302"]},
-        {urls = ["turns:YOUR_TURN:5349","turn:YOUR_TURN:3478?transport=tcp"], username="USER", credential="PASS"}
-      ]
-    """
-    ice = st.secrets.get("ice", None)
-    if ice and "servers" in ice and ice["servers"]:
-        cfg = {"iceServers": ice["servers"]}
-        if "policy" in ice:
-            cfg["iceTransportPolicy"] = ice["policy"]
-        return cfg
-    # default to STUN-only (fine on localhost/LAN)
-    return {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+HF_REPO = "RishiPTrial/stage_modelv2"
+HF_BRANCH = "main"
+MODEL_EXTS = (".h5",)
 
-def has_turn(cfg: dict) -> bool:
-    for srv in cfg.get("iceServers", []):
-        urls = srv.get("urls", [])
-        if isinstance(urls, str):
-            urls = [urls]
-        for u in urls:
-            if isinstance(u, str) and u.startswith(("turn:", "turns:")):
-                return True
-    return False
+# WebRTC STUN (required for Streamlit Cloud / browsers)
+RTC_CFG = RTCConfiguration({
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+})
 
-# ─── Build clean architecture (for fallback/weights-by-name) ──────────────────
-def build_clean_model(num_classes=len(STAGE_LABELS)):
-    base = InceptionV3(include_top=False, weights="imagenet", input_shape=(INPUT_SIZE, INPUT_SIZE, 3))
-    x = layers.GlobalAveragePooling2D(name="global_average_pooling2d")(base.output)
-    # Name head 'dense_1' to match typical legacy naming, aiding by-name weight loading
-    out = layers.Dense(num_classes, activation="softmax", name="dense_1")(x)
-    return Model(base.input, out)
+# ----------------------------
+# Helpers
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def list_models(repo_id: str, revision: str) -> List[str]:
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id, revision=revision)
+    return [f for f in files if f.lower().endswith(MODEL_EXTS)]
 
-# ─── Robust loader for .keras with safe fallbacks ──────────────────────────────
-@st.cache_resource(show_spinner="Loading model from Hugging Face…")
-def load_keras_or_fallback():
-    # Try the .keras first
-    keras_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILE, token=st.secrets.get("HF_TOKEN"))
+@st.cache_resource(show_spinner=True)
+def download_model(repo_id: str, filename: str, revision: str) -> str:
+    return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
+
+def _infer_arch_from_name(name: str) -> str:
+    n = name.lower()
+    if "inception" in n:
+        return "inceptionv3"
+    if "resnet" in n:
+        return "resnet50"
+    return "generic"
+
+def _get_preprocess(name: str) -> Callable[[np.ndarray], np.ndarray]:
+    arch = _infer_arch_from_name(name)
+    if arch == "resnet50":
+        from tensorflow.keras.applications.resnet50 import preprocess_input as pp
+        return pp
+    if arch == "inceptionv3":
+        from tensorflow.keras.applications.inception_v3 import preprocess_input as pp
+        return pp
+    # Fallback: scale to [0,1]
+    return lambda x: x / 255.0
+
+@dataclass
+class ModelBundle:
+    model: tf.keras.Model
+    input_hw: Tuple[int, int]
+    preprocess: Callable[[np.ndarray], np.ndarray]
+    labels: List[str]
+
+@st.cache_resource(show_spinner=True)
+def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
+    # Load model (no optimizer/metrics required)
+    model = tf.keras.models.load_model(model_path, compile=False)
+
+    # Determine input size
+    # Try model.input_shape like (None, H, W, 3)
     try:
-        # 1) Keras-3 native load; safe_mode=False avoids some strict config checks
-        return k3_load_model(keras_path, compile=False, safe_mode=False)
-    except Exception as e1:
-        st.warning(f"Direct .keras load failed: {type(e1).__name__}: {e1}\n"
-                   "Trying clean-graph + weights-by-name fallback…")
-
-    # 2) Clean graph + (optional) sidecar weights
-    model = build_clean_model()
-    # If you’ve also uploaded a weights-only file, try to load it
-    try:
-        weights_path = hf_hub_download(repo_id=HF_REPO_ID, filename=WEIGHTS_FILE, token=st.secrets.get("HF_TOKEN"))
-        model.load_weights(weights_path, by_name=True, skip_mismatch=True)
-        st.info("Loaded weights by name from weights.h5 (skipped mismatches).")
+        ishape = model.input_shape
+        h = int(ishape[1]) if ishape[1] is not None else None
+        w = int(ishape[2]) if ishape[2] is not None else None
     except Exception:
-        # If no weights file available, we still have a usable (ImageNet-initialized) model
-        st.info("No weights file found or load skipped; using ImageNet-initialized backbone.")
+        h = w = None
 
-    return model
+    if h is None or w is None:
+        # Reasonable defaults by architecture
+        arch = _infer_arch_from_name(model_filename)
+        if arch == "inceptionv3":
+            h = w = 299
+        else:
+            h = w = 224
 
-model = load_keras_or_fallback()
-
-# ─── Inference utils ───────────────────────────────────────────────────────────
-def preprocess_image(pil: Image.Image) -> np.ndarray:
-    pil = pil.resize((INPUT_SIZE, INPUT_SIZE)).convert("RGB")
-    arr = np.asarray(pil, dtype=np.float32)
-    return preprocess_input(arr)
-
-def classify(pil: Image.Image):
-    arr = preprocess_image(pil)
-    preds = model.predict(arr[np.newaxis], verbose=0)[0]
-    idx = int(np.argmax(preds))
-    return STAGE_LABELS[idx], float(preds[idx])
-
-def draw_overlay(pil: Image.Image, text: str):
-    draw = ImageDraw.Draw(pil)
+    # Determine number of classes and create default labels if none provided
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        n_classes = int(model.output_shape[-1])
     except Exception:
-        font = ImageFont.load_default()
-    try:
-        x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
-    except Exception:
-        w, h = draw.textsize(text, font=font)
-        x0, y0, x1, y1 = 0, 0, w, h
-    pad = 6
-    draw.rectangle([x0 - pad, y0 - pad, x1 + pad, y1 + pad], fill="black")
-    draw.text((0, 0), text, font=font, fill="red")
-    return pil
+        # last-resort guess
+        n_classes = 2
+    labels = [f"Class {i}" for i in range(n_classes)]
 
-# ─── UI ────────────────────────────────────────────────────────────────────────
-st.title("Live Drosophila Detection")
-st.caption("Per-frame predictions using your .keras model. Choose an input method below.")
+    preprocess = _get_preprocess(model_filename)
 
-mode = st.radio(
-    "Input",
-    ["Live webcam (WebRTC)", "Snapshot (no WebRTC)", "Upload video (no WebRTC)"],
-    index=0,
-    horizontal=True,
-)
-
-# ─── Live webcam (start only if TURN exists or user confirms localhost) ───────
-if mode == "Live webcam (WebRTC)":
-    rtc_cfg = get_rtc_configuration()
-    if not has_turn(rtc_cfg):
-        st.info("No TURN configured. On cloud this may fail. If you’re on localhost/LAN, tick to proceed with STUN-only.")
-        if not st.checkbox("I’m on localhost/LAN → proceed with STUN-only"):
-            st.stop()
-
-    class SimpleProcessor(VideoProcessorBase):
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="rgb24")
-            pil = Image.fromarray(img)
-            try:
-                label, conf = classify(pil)
-            except Exception:
-                label, conf = "error", 0.0
-            text = f"{label} ({conf:.0%})"
-            pil = draw_overlay(pil, text)
-            return av.VideoFrame.from_ndarray(np.array(pil), format="rgb24")
-
-    webrtc_streamer(
-        key="live",
-        mode=WebRtcMode.SENDRECV,
-        media_stream_constraints={
-            "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15, "max": 15}},
-            "audio": False,
-        },
-        video_processor_factory=SimpleProcessor,
-        async_processing=False,
-        rtc_configuration=rtc_cfg,
+    return ModelBundle(
+        model=model,
+        input_hw=(h, w),
+        preprocess=preprocess,
+        labels=labels
     )
 
-# ─── Snapshot (always works) ───────────────────────────────────────────────────
-elif mode == "Snapshot (no WebRTC)":
-    snap = st.camera_input("Take a snapshot:")
-    if snap is not None:
-        pil = Image.open(snap)
-        label, conf = classify(pil)
-        st.success(f"{label} ({conf:.0%})")
-        st.image(draw_overlay(pil, f"{label} ({conf:.0%})"), caption="Snapshot prediction")
+def softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
 
-# ─── Video upload (simulated live) ─────────────────────────────────────────────
-else:
-    vid = st.file_uploader("Upload a short video (MP4/MOV/M4V):", type=["mp4", "mov", "m4v"])
-    if vid is not None:
-        placeholder = st.empty()
-        with av.open(vid) as container:
-            stream = container.streams.video[0]
-            fps = float(stream.average_rate) if stream.average_rate else 15.0
-            for frame in container.decode(video=0):
-                pil = frame.to_image().convert("RGB")
-                label, conf = classify(pil)
-                out = draw_overlay(pil.copy(), f"{label} ({conf:.0%})")
-                placeholder.image(out, use_column_width=True)
-                time.sleep(1.0 / max(fps, 1.0))
-# ---------------- End app.py ---------------
+def draw_label_box(
+    frame_bgr: np.ndarray,
+    text: str,
+    score: float,
+    pos: Tuple[int, int] = (10, 30)
+) -> np.ndarray:
+    x, y = pos
+    label = f"{text}: {score:.2f}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.7
+    thickness = 2
+
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+    pad = 6
+    cv2.rectangle(frame_bgr, (x - pad, y - th - pad), (x + tw + pad, y + pad), (0, 0, 0), -1)
+    cv2.putText(frame_bgr, label, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return frame_bgr
+
+# ----------------------------
+# Sidebar Controls
+# ----------------------------
+with st.sidebar:
+    st.header("⚙️ Settings")
+
+    available_models = list_models(HF_REPO, HF_BRANCH)
+    if not available_models:
+        st.error("No .h5 models found in your Hugging Face repo.")
+        st.stop()
+
+    selected_model = st.selectbox(
+        "Select a model file",
+        options=available_models,
+        index=available_models.index("CLEANED_drosophila_stage_resnet50.h5")
+        if "CLEANED_drosophila_stage_resnet50.h5" in available_models else 0
+    )
+
+    conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.5, 0.01)
+    infer_every_n = st.slider("Run inference every N frames", 1, 6, 3, 1)
+    flip_horizontal = st.checkbox("Mirror webcam (selfie view)", True)
+    show_topk = st.slider("Show Top-K classes", 1, 5, 3, 1)
+
+st.caption("Repo: " + HF_REPO)
+
+# ----------------------------
+# Load/Cache Model
+# ----------------------------
+with st.spinner(f"Downloading & loading: {selected_model}"):
+    local_path = download_model(HF_REPO, selected_model, HF_BRANCH)
+    bundle = load_model_bundle(local_path, selected_model)
+
+# Warm-up (build graph for faster first prediction)
+# Use tiny dummy input in correct size
+try:
+    dummy = np.zeros((1, bundle.input_hw[0], bundle.input_hw[1], 3), dtype=np.float32)
+    _ = bundle.model.predict(dummy, verbose=0)
+except Exception:
+    pass
+
+st.success(f"Loaded **{selected_model}** | input: {bundle.input_hw[0]}×{bundle.input_hw[1]} | classes: {len(bundle.labels)}")
+
+# ----------------------------
+# WebRTC Processor
+# ----------------------------
+class LiveVideoProcessor(VideoProcessorBase):
+    def __init__(self, bundle: ModelBundle, conf_thr: float, n_skip: int, flip: bool, topk: int):
+        self.bundle = bundle
+        self.conf_thr = conf_thr
+        self.n_skip = max(1, n_skip)
+        self.flip = flip
+        self.topk = topk
+        self._frame_count = 0
+        self._last_pred = None  # (label, score, topk list)
+
+    def _predict(self, bgr: np.ndarray):
+        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, self.bundle.input_hw[::-1])  # (W,H) order for OpenCV
+        arr = img.astype(np.float32)
+        arr = self.bundle.preprocess(arr)
+        arr = np.expand_dims(arr, axis=0)
+
+        preds = self.bundle.model.predict(arr, verbose=0)
+        preds = preds[0] if isinstance(preds, (list, tuple)) else preds
+        preds = np.array(preds).reshape(-1)
+
+        # If model did not include softmax, apply for stable top-k display
+        if np.max(preds) > 1.0 or np.min(preds) < 0.0:
+            probs = softmax(preds)
+        else:
+            # assume already probabilities
+            probs = preds
+
+        top_indices = np.argsort(probs)[::-1][: self.topk]
+        top = [(self.bundle.labels[i] if i < len(self.bundle.labels) else f"Class {i}", float(probs[i])) for i in top_indices]
+        label, score = top[0]
+        return label, score, top
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        if self.flip:
+            img = cv2.flip(img, 1)
+
+        self._frame_count += 1
+        update_now = (self._frame_count % self.n_skip == 0) or (self._last_pred is None)
+
+        if update_now:
+            try:
+                self._last_pred = self._predict(img)
+            except Exception as e:
+                # Draw error once and keep going
+                err = f"Inference error: {str(e)[:60]}"
+                cv2.putText(img, err, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        if self._last_pred:
+            label, score, top = self._last_pred
+            if score >= self.conf_thr:
+                img = draw_label_box(img, label, score, (10, 30))
+            # draw top-k sidebar bar
+            y0 = 60
+            for i, (lbl, sc) in enumerate(top):
+                text = f"{i+1}. {lbl} — {sc:.2f}"
+                cv2.putText(img, text, (10, y0 + i*24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# ----------------------------
+# Start Webcam
+# ----------------------------
+st.subheader("🎥 Live Webcam")
+st.info("Click **Start** to allow webcam. For performance on CPU, the app predicts every Nth frame (tweak in the sidebar).")
+
+webrtc_ctx = webrtc_streamer(
+    key=f"webrtc-{selected_model}",  # key includes model name so switching reloads processor
+    mode="SENDRECV",
+    rtc_configuration=RTC_CFG,
+    video_processor_factory=lambda: LiveVideoProcessor(
+        bundle=bundle,
+        conf_thr=conf_threshold,
+        n_skip=infer_every_n,
+        flip=flip_horizontal,
+        topk=show_topk,
+    ),
+    media_stream_constraints={"video": True, "audio": False},
+)
+
+st.caption(
+    "Tip: If you see a black or frozen preview, refresh the page or toggle camera permissions. "
+    "Safari/iOS users: make sure you're on HTTPS (Streamlit Cloud is HTTPS by default)."
+)

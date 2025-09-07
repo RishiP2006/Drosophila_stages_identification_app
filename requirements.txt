@@ -3,8 +3,8 @@ streamlit-webrtc>=0.47
 huggingface_hub>=0.23
 opencv-python-headless>=4.9.0
 av>=10.0.0
-tensorflow==2.15.1
-keras==2.15.0
+keras==3.3.2
+tensorflow==2.16.1
 numpy>=1.26
 pillow>=10.0.0
 h5py>=3.10.0

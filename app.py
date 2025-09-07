@@ -1,11 +1,11 @@
 # =========================
-# Drosophila Stage — Live Video Classifier (Keras 3, Lambda-safe)
+# Drosophila Stage — Live Video Classifier (Keras 3, Lambda-safe, minimal UI)
 # =========================
 
-# --- Env BEFORE any Keras/TF import ---
+# --- Environment BEFORE any Keras/TF import ---
 import os
 os.environ["KERAS_BACKEND"] = "tensorflow"   # Keras 3 backend
-os.environ["CUDA_VISIBLE_DEVICES"] = ""       # no GPU probing on Streamlit Cloud
+os.environ["CUDA_VISIBLE_DEVICES"] = ""       # avoid GPU probing on Streamlit Cloud
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"      # quieter TF logs
 
 # --- Standard libs ---
@@ -17,7 +17,12 @@ import cv2
 import numpy as np
 import streamlit as st
 from huggingface_hub import HfApi, hf_hub_download
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from streamlit_webrtc import (
+    webrtc_streamer,
+    VideoProcessorBase,
+    RTCConfiguration,
+    WebRtcMode,
+)
 
 # =========================
 # App config
@@ -29,11 +34,12 @@ HF_REPO = "RishiPTrial/stage_modelv2"
 HF_BRANCH = "main"
 MODEL_EXTS = (".keras",)
 
-RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-
+RTC_CFG = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 # =========================
-# HF helpers
+# Hugging Face helpers
 # =========================
 @st.cache_data(show_spinner=False)
 def list_models(repo_id: str, revision: str) -> List[str]:
@@ -45,9 +51,8 @@ def list_models(repo_id: str, revision: str) -> List[str]:
 def download_from_hf(repo_id: str, filename: str, revision: str) -> str:
     return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
 
-
 # =========================
-# Preprocessing (inline)
+# Preprocessing (inline; no keras.applications imports)
 # =========================
 def _arch_from_name(name: str) -> str:
     n = name.lower()
@@ -57,15 +62,15 @@ def _arch_from_name(name: str) -> str:
     return "generic"
 
 def preprocess_resnet50(rgb_0_255: np.ndarray) -> np.ndarray:
-    # caffe-style: RGB->BGR + mean subtraction; model expects 0..255 input
-    x = rgb_0_255[..., ::-1].copy()
+    # caffe-style: RGB->BGR + mean subtraction; expects uint/float 0..255 input
+    x = rgb_0_255[..., ::-1].copy()  # to BGR
     x[..., 0] -= 103.939
     x[..., 1] -= 116.779
     x[..., 2] -= 123.68
     return x
 
 def preprocess_convnext(rgb_0_255: np.ndarray) -> np.ndarray:
-    # matches your training (ImageDataGenerator rescale=1./255)
+    # matches your training pipeline (ImageDataGenerator rescale=1./255)
     return rgb_0_255 / 255.0
 
 def preprocess_inceptionv3(rgb_0_255: np.ndarray) -> np.ndarray:
@@ -80,9 +85,9 @@ def default_preprocess_for_filename(model_filename: str) -> Callable[[np.ndarray
 
 def softmax_safe(x: np.ndarray) -> np.ndarray:
     x = x - np.max(x)
-    e = np.exp(x); s = np.sum(e)
+    e = np.exp(x)
+    s = np.sum(e)
     return e / s if s != 0 else np.zeros_like(x)
-
 
 # =========================
 # Model bundle
@@ -95,6 +100,7 @@ class ModelBundle:
     labels: List[str]
 
 def _has_input_preproc_layers(model: Any) -> bool:
+    """Detect early Lambda/Rescaling/Normalization to avoid double preprocessing."""
     try:
         for lyr in model.layers[:6]:
             if lyr.__class__.__name__ in ("Lambda", "Rescaling", "Normalization"):
@@ -111,22 +117,20 @@ def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
         st.error(f"Detected keras=={ver}. Pin keras==3.3.2 and tensorflow==2.16.1.")
         st.stop()
 
-    # 1) Try normal safe load
+    # 1) Try safe load first
     replaced_lambda = False
     try:
-        model = keras.saving.load_model(model_path, compile=False)
+        model = keras.saving.load_model(model_path, compile=False)  # safe by default
     except Exception:
-        # 2) Retry: map serialized 'preprocess_input' to an identity that works on KerasTensors.
+        # 2) Retry: map serialized 'preprocess_input' Lambda to identity to bypass shape inference
         def _identity(x):
             return tf.identity(x)
-
         try:
             try:
                 from keras import config as KCFG
                 KCFG.enable_unsafe_deserialization()
             except Exception:
                 pass
-
             model = keras.saving.load_model(
                 model_path,
                 compile=False,
@@ -138,7 +142,7 @@ def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
             st.error(f"Failed to load model '{model_filename}'. Error:\n{e2}")
             st.stop()
 
-    # Input size
+    # Infer input size
     try:
         ishape = model.inputs[0].shape  # (None, H, W, C)
         h = int(ishape[1]); w = int(ishape[2])
@@ -146,7 +150,7 @@ def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
         a = _arch_from_name(model_filename)
         h = w = 224 if a in ("resnet50", "convnext", "generic") else 299
 
-    # Classes & labels
+    # Classes & default labels
     try:
         oshape = model.outputs[0].shape
         n_classes = int(oshape[-1])
@@ -155,15 +159,14 @@ def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
     labels = [f"Class {i}" for i in range(n_classes)]
 
     # Decide external preprocessing:
-    # If we replaced the internal Lambda with identity, we MUST preprocess externally.
-    # Else, if the model already has early preprocessing layers, skip external preprocessing.
+    # If we replaced the internal Lambda with identity, we MUST preprocess externally (per filename).
+    # Else, if model already has early preprocessing layers, use identity; otherwise use default.
     if replaced_lambda:
         preprocess = default_preprocess_for_filename(model_filename)
     else:
         preprocess = (lambda x: x) if _has_input_preproc_layers(model) else default_preprocess_for_filename(model_filename)
 
     return ModelBundle(model=model, input_hw=(h, w), preprocess=preprocess, labels=labels)
-
 
 # =========================
 # Sidebar — minimal: pick model
@@ -189,7 +192,7 @@ with st.spinner(f"Downloading & loading: {selected_model}"):
     model_local_path = download_from_hf(HF_REPO, selected_model, HF_BRANCH)
     bundle = load_model_bundle(model_local_path, selected_model)
 
-# Warm-up
+# Optional warm-up
 try:
     dummy = np.zeros((1, bundle.input_hw[0], bundle.input_hw[1], 3), dtype=np.float32)
     _ = bundle.model.predict(dummy, verbose=0)
@@ -204,8 +207,11 @@ st.success(f"Loaded **{selected_model}** | Input: {bundle.input_hw[0]}×{bundle.
 def draw_label_box(frame_bgr: np.ndarray, text: str, score: float, pos=(10, 30)) -> np.ndarray:
     x, y = pos
     label = f"{text}: {score:.2f}"
-    font = cv2.FONT_HERSHEY_SIMPLEX; scale = 0.7; thickness = 2
-    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness); pad = 6
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.7
+    thickness = 2
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+    pad = 6
     cv2.rectangle(frame_bgr, (x - pad, y - th - pad), (x + tw + pad, y + pad), (0, 0, 0), -1)
     cv2.putText(frame_bgr, label, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return frame_bgr
@@ -243,10 +249,10 @@ class LiveVideoProcessor(VideoProcessorBase):
 st.subheader("🎥 Live Webcam")
 webrtc_streamer(
     key=f"webrtc-{selected_model}",
-    mode="SENDRECV",
+    mode=WebRtcMode.SENDRECV,               # <-- FIXED: use enum, not string
     rtc_configuration=RTC_CFG,
     video_processor_factory=lambda: LiveVideoProcessor(bundle=bundle),
     media_stream_constraints={"video": True, "audio": False},
 )
 
-st.caption("If preview is black/frozen, refresh or toggle camera permissions. HTTPS is required for webcam.")
+st.caption("If the preview is black/frozen, refresh or toggle camera permissions. HTTPS is required for webcam.")

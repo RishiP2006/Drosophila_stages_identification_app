@@ -1,12 +1,8 @@
-# =========================
-# Drosophila Stage — Live Video Classifier (Keras 3, Lambda-safe, with labels)
-# =========================
 
-# --- Environment BEFORE any Keras/TF import ---
 import os
-os.environ["KERAS_BACKEND"] = "tensorflow"   # Keras 3 backend
-os.environ["CUDA_VISIBLE_DEVICES"] = ""       # avoid GPU probing on Streamlit Cloud
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"      # quieter TF logs
+os.environ["KERAS_BACKEND"] = "tensorflow"   
+os.environ["CUDA_VISIBLE_DEVICES"] = ""     
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"   
 
 # --- Standard libs ---
 from dataclasses import dataclass
@@ -25,9 +21,7 @@ from streamlit_webrtc import (
     WebRtcMode,
 )
 
-# =========================
-# App config
-# =========================
+
 st.set_page_config(page_title="Drosophila Stage — Live Classifier", layout="wide")
 st.title("🪰 Drosophila Stage — Live Video Classifier")
 
@@ -51,9 +45,7 @@ CANONICAL_8_LABELS = [
 RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 
 
-# =========================
-# Hugging Face helpers
-# =========================
+
 @st.cache_data(show_spinner=False)
 def list_models(repo_id: str, revision: str) -> List[str]:
     api = HfApi()
@@ -91,9 +83,7 @@ def try_load_labels(repo_id: str, revision: str) -> Optional[List[str]]:
     return None
 
 
-# =========================
-# Preprocessing (inline; no keras.applications imports)
-# =========================
+
 def _arch_from_name(name: str) -> str:
     n = name.lower()
     if "convnext" in n: return "convnext"
@@ -130,9 +120,7 @@ def softmax_safe(x: np.ndarray) -> np.ndarray:
     return e / s if s != 0 else np.zeros_like(x)
 
 
-# =========================
-# Model bundle
-# =========================
+
 @dataclass
 class ModelBundle:
     model: Any
@@ -198,7 +186,7 @@ def load_model_bundle(model_path: str, model_filename: str, repo_id: str, revisi
     except Exception:
         n_classes = 2
 
-    # Load labels (HF -> fallback)
+    # Load labels (HF > fallback)
     labels = try_load_labels(repo_id, revision)
     if labels is None and n_classes == 8:
         labels = CANONICAL_8_LABELS.copy()
@@ -215,9 +203,7 @@ def load_model_bundle(model_path: str, model_filename: str, repo_id: str, revisi
     return ModelBundle(model=model, input_hw=(h, w), preprocess=preprocess, labels=labels)
 
 
-# =========================
-# Sidebar — minimal: pick model
-# =========================
+
 with st.sidebar:
     st.header("Model")
     models = list_models(HF_REPO, HF_BRANCH)
@@ -251,9 +237,7 @@ st.success(
     f"Classes: {len(bundle.labels)} → {', '.join(bundle.labels)}"
 )
 
-# =========================
-# Live video — predict every frame (top-1)
-# =========================
+
 def draw_label_box(frame_bgr: np.ndarray, text: str, score: float, pos=(10, 30)) -> np.ndarray:
     x, y = pos
     label = f"{text}: {score:.2f}"

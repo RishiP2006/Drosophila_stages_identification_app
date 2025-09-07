@@ -1,28 +1,14 @@
 # =========================
-# Drosophila Stage — Live Classifier (minimal UI, Streamlit Cloud safe)
+# Drosophila Stage — Live Classifier (minimal, error-hardened)
 # =========================
 
-# ---- Env (must be set before any TF/Keras import) ----
-import os, sys
-os.environ["TF_USE_LEGACY_KERAS"] = "1"
-os.environ["TF_KERAS"] = "1"
-os.environ["KERAS_BACKEND"] = "tensorflow"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# --- Set env BEFORE any Keras/TF import ---
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"  # use TF backend for standalone Keras
+os.environ["CUDA_VISIBLE_DEVICES"] = ""      # avoid GPU lookups on Streamlit Cloud
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"     # quieter TF logs
 
-def _get_tf_with_keras_alias():
-    """
-    Import TensorFlow and alias any future `import keras` to `tf.keras`
-    to avoid keras v3 recursion / lazy-loader issues.
-    """
-    for k in list(sys.modules.keys()):
-        if k == "keras" or k.startswith("keras."):
-            del sys.modules[k]
-    import tensorflow as tf
-    sys.modules["keras"] = tf.keras
-    return tf
-
-# ---- Regular imports ----
+# --- Standard imports (safe) ---
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -42,13 +28,13 @@ st.title("🪰 Drosophila Stage — Live Video Classifier")
 
 HF_REPO = "RishiPTrial/stage_modelv2"
 HF_BRANCH = "main"
-MODEL_EXTS = (".h5",)  # keep to .h5 for tf.keras 2.15 compatibility
+MODEL_EXTS = (".h5",)  # load with standalone Keras 2.15
 
 RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 
 
 # =========================
-# Hugging Face helpers
+# HF helpers
 # =========================
 @st.cache_data(show_spinner=False)
 def list_models(repo_id: str, revision: str) -> List[str]:
@@ -62,7 +48,7 @@ def download_from_hf(repo_id: str, filename: str, revision: str) -> str:
 
 
 # =========================
-# Preprocess (inline; no keras imports)
+# Preprocess (inline; no keras/tf imports)
 # =========================
 def _arch_from_name(name: str) -> str:
     n = name.lower()
@@ -106,14 +92,17 @@ class ModelBundle:
 
 @st.cache_resource(show_spinner=True)
 def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
-    tf = _get_tf_with_keras_alias()
-    if not tf.__version__.startswith("2.15"):
-        st.error(f"TensorFlow {tf.__version__} detected. Please pin tensorflow==2.15.1.")
+    # Import standalone Keras (v2.15) ONLY; do NOT import tensorflow.keras.*
+    import keras
+    ver = getattr(keras, "__version__", "unknown")
+    if not ver.startswith("2.15"):
+        st.error(f"Detected keras=={ver}. Pin keras==2.15.0 and tensorflow==2.15.1 in requirements.txt, then restart.")
         st.stop()
 
-    model = tf.keras.models.load_model(model_path, compile=False)
+    # Load legacy H5 with standalone Keras
+    model = keras.models.load_model(model_path, compile=False)
 
-    # Input size
+    # Infer input size
     try:
         ishape = model.input_shape  # (None, H, W, C)
         h = int(ishape[1]) if ishape[1] is not None else None
@@ -165,7 +154,7 @@ st.success(f"Loaded **{selected_model}** | Input: {bundle.input_hw[0]}×{bundle.
 
 
 # =========================
-# Video processor — per-frame prediction (no extra controls)
+# Video: predict every frame (top-1 only)
 # =========================
 def draw_label_box(frame_bgr: np.ndarray, text: str, score: float, pos=(10, 30)) -> np.ndarray:
     x, y = pos
@@ -200,22 +189,16 @@ class LiveVideoProcessor(VideoProcessorBase):
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
-        # Mirror for natural selfie view
-        img = cv2.flip(img, 1)
-
+        img = cv2.flip(img, 1)  # mirror for selfie view
         try:
             label, score = self._predict_top1(img)
             img = draw_label_box(img, label, score, (10, 30))
         except Exception as e:
             cv2.putText(img, f"Inference error: {str(e)[:60]}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-# =========================
-# Webcam
-# =========================
 st.subheader("🎥 Live Webcam")
 webrtc_streamer(
     key=f"webrtc-{selected_model}",
@@ -225,4 +208,4 @@ webrtc_streamer(
     media_stream_constraints={"video": True, "audio": False},
 )
 
-st.caption("Tip: If preview is black/frozen, refresh or toggle camera permissions. HTTPS is required for webcam.")
+st.caption("If preview is black/frozen, refresh or toggle camera permissions. HTTPS is required for webcam.")

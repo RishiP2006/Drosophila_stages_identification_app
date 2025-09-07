@@ -1,5 +1,5 @@
 # =========================
-# Drosophila Stage — Live Video Classifier (Keras 3, Lambda-safe, minimal UI)
+# Drosophila Stage — Live Video Classifier (Keras 3, Lambda-safe, with labels)
 # =========================
 
 # --- Environment BEFORE any Keras/TF import ---
@@ -14,6 +14,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import av
 import cv2
+import json
 import numpy as np
 import streamlit as st
 from huggingface_hub import HfApi, hf_hub_download
@@ -33,10 +34,22 @@ st.title("🪰 Drosophila Stage — Live Video Classifier")
 HF_REPO = "RishiPTrial/stage_modelv2"
 HF_BRANCH = "main"
 MODEL_EXTS = (".keras",)
+LABEL_FILE_CANDIDATES = ["labels.json", "classes.txt", "class_names.txt"]
 
-RTC_CFG = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+# Fallback labels for your 8 classes (order matches your training folder names 1..8)
+CANONICAL_8_LABELS = [
+    "Egg",
+    "First Instar",
+    "Second Instar",
+    "Third Instar",
+    "White Pupa",
+    "Brown Pupa",
+    "Eye Pupa",
+    "Black Pupa",
+]
+
+RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
 
 # =========================
 # Hugging Face helpers
@@ -50,6 +63,33 @@ def list_models(repo_id: str, revision: str) -> List[str]:
 @st.cache_resource(show_spinner=True)
 def download_from_hf(repo_id: str, filename: str, revision: str) -> str:
     return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
+
+@st.cache_data(show_spinner=False)
+def try_load_labels(repo_id: str, revision: str) -> Optional[List[str]]:
+    """Try to fetch labels from common filenames in the HF repo."""
+    for fname in LABEL_FILE_CANDIDATES:
+        try:
+            path = hf_hub_download(repo_id=repo_id, filename=fname, revision=revision)
+        except Exception:
+            continue
+        try:
+            if fname.endswith(".json"):
+                with open(path, "r", encoding="utf-8") as f:
+                    arr = json.load(f)
+                if isinstance(arr, list) and all(isinstance(s, str) for s in arr):
+                    labels = [s.strip() for s in arr if s.strip()]
+                    if labels:
+                        return labels
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f.readlines()]
+                labels = [ln for ln in lines if ln]
+                if labels:
+                    return labels
+        except Exception:
+            continue
+    return None
+
 
 # =========================
 # Preprocessing (inline; no keras.applications imports)
@@ -89,6 +129,7 @@ def softmax_safe(x: np.ndarray) -> np.ndarray:
     s = np.sum(e)
     return e / s if s != 0 else np.zeros_like(x)
 
+
 # =========================
 # Model bundle
 # =========================
@@ -110,7 +151,7 @@ def _has_input_preproc_layers(model: Any) -> bool:
     return False
 
 @st.cache_resource(show_spinner=True)
-def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
+def load_model_bundle(model_path: str, model_filename: str, repo_id: str, revision: str) -> ModelBundle:
     import keras, tensorflow as tf
     ver = getattr(keras, "__version__", "unknown")
     if not ver.startswith("3."):
@@ -150,23 +191,29 @@ def load_model_bundle(model_path: str, model_filename: str) -> ModelBundle:
         a = _arch_from_name(model_filename)
         h = w = 224 if a in ("resnet50", "convnext", "generic") else 299
 
-    # Classes & default labels
+    # Determine number of classes
     try:
         oshape = model.outputs[0].shape
         n_classes = int(oshape[-1])
     except Exception:
         n_classes = 2
-    labels = [f"Class {i}" for i in range(n_classes)]
+
+    # Load labels (HF -> fallback)
+    labels = try_load_labels(repo_id, revision)
+    if labels is None and n_classes == 8:
+        labels = CANONICAL_8_LABELS.copy()
+    if labels is None or len(labels) != n_classes:
+        # final fallback to generic labels if mismatch
+        labels = [f"Class {i}" for i in range(n_classes)]
 
     # Decide external preprocessing:
-    # If we replaced the internal Lambda with identity, we MUST preprocess externally (per filename).
-    # Else, if model already has early preprocessing layers, use identity; otherwise use default.
     if replaced_lambda:
         preprocess = default_preprocess_for_filename(model_filename)
     else:
         preprocess = (lambda x: x) if _has_input_preproc_layers(model) else default_preprocess_for_filename(model_filename)
 
     return ModelBundle(model=model, input_hw=(h, w), preprocess=preprocess, labels=labels)
+
 
 # =========================
 # Sidebar — minimal: pick model
@@ -190,7 +237,7 @@ st.caption(f"Models source: {HF_REPO}")
 # Download + load
 with st.spinner(f"Downloading & loading: {selected_model}"):
     model_local_path = download_from_hf(HF_REPO, selected_model, HF_BRANCH)
-    bundle = load_model_bundle(model_local_path, selected_model)
+    bundle = load_model_bundle(model_local_path, selected_model, HF_REPO, HF_BRANCH)
 
 # Optional warm-up
 try:
@@ -199,7 +246,10 @@ try:
 except Exception:
     pass
 
-st.success(f"Loaded **{selected_model}** | Input: {bundle.input_hw[0]}×{bundle.input_hw[1]} | Classes: {len(bundle.labels)}")
+st.success(
+    f"Loaded **{selected_model}** | Input: {bundle.input_hw[0]}×{bundle.input_hw[1]} | "
+    f"Classes: {len(bundle.labels)} → {', '.join(bundle.labels)}"
+)
 
 # =========================
 # Live video — predict every frame (top-1)
@@ -249,7 +299,7 @@ class LiveVideoProcessor(VideoProcessorBase):
 st.subheader("🎥 Live Webcam")
 webrtc_streamer(
     key=f"webrtc-{selected_model}",
-    mode=WebRtcMode.SENDRECV,               # <-- FIXED: use enum, not string
+    mode=WebRtcMode.SENDRECV,
     rtc_configuration=RTC_CFG,
     video_processor_factory=lambda: LiveVideoProcessor(bundle=bundle),
     media_stream_constraints={"video": True, "audio": False},

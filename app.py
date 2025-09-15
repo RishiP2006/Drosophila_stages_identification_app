@@ -23,7 +23,7 @@ from streamlit_webrtc import (
 
 
 st.set_page_config(page_title="Drosophila Stage — Live Classifier", layout="wide")
-st.title("🪰 Drosophila Stage — Live Video Classifier")
+st.title("Drosophila Stage — Live Video Classifier")
 
 HF_REPO = "RishiPTrial/stage_modelv2"
 HF_BRANCH = "main"

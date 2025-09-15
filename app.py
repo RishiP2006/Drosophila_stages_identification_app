@@ -232,10 +232,7 @@ try:
 except Exception:
     pass
 
-st.success(
-    f"Loaded **{selected_model}** | Input: {bundle.input_hw[0]}×{bundle.input_hw[1]} | "
-    f"Classes: {len(bundle.labels)} → {', '.join(bundle.labels)}"
-)
+
 
 
 def draw_label_box(frame_bgr: np.ndarray, text: str, score: float, pos=(10, 30)) -> np.ndarray:

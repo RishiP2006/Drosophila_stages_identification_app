@@ -1,3 +1,4 @@
+
 import os
 os.environ["KERAS_BACKEND"] = "tensorflow"   
 os.environ["CUDA_VISIBLE_DEVICES"] = ""     
@@ -167,7 +168,7 @@ def load_model_bundle(model_path: str, model_filename: str, repo_id: str, revisi
             )
             replaced_lambda = True
         except Exception as e2:
-            st.error(f"Failed to load model '{model_filename'. Error:\n{e2}")
+            st.error(f"Failed to load model '{model_filename}'. Error:\n{e2}")
             st.stop()
 
     # Infer input size
@@ -231,7 +232,11 @@ try:
 except Exception:
     pass
 
-# --- REMOVED the st.success(...) block that printed model/labels info ---
+st.success(
+    f"Loaded **{selected_model}** | Input: {bundle.input_hw[0]}×{bundle.input_hw[1]} | "
+    f"Classes: {len(bundle.labels)} → {', '.join(bundle.labels)}"
+)
+
 
 def draw_label_box(frame_bgr: np.ndarray, text: str, score: float, pos=(10, 30)) -> np.ndarray:
     x, y = pos
@@ -244,51 +249,6 @@ def draw_label_box(frame_bgr: np.ndarray, text: str, score: float, pos=(10, 30))
     cv2.rectangle(frame_bgr, (x - pad, y - th - pad), (x + tw + pad, y + pad), (0, 0, 0), -1)
     cv2.putText(frame_bgr, label, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return frame_bgr
-
-# ---- NEW: image upload inference ----
-st.subheader("📷 Upload Image(s)")
-uploaded_files = st.file_uploader("Upload Drosophila images (JPG/PNG)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-
-def predict_top1_from_bgr(bgr: np.ndarray, bundle: ModelBundle) -> Tuple[str, float]:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    rgb = cv2.resize(rgb, bundle.input_hw[::-1])  # (W, H)
-    arr = rgb.astype(np.float32)
-    arr = bundle.preprocess(arr)                   # external preprocessing (or identity)
-    arr = np.expand_dims(arr, axis=0)
-
-    preds = bundle.model.predict(arr, verbose=0)
-    preds = preds[0] if isinstance(preds, (list, tuple)) else preds
-    preds = np.array(preds).reshape(-1)
-
-    probs = softmax_safe(preds) if (np.max(preds) > 1.0 or np.min(preds) < 0.0) else preds
-    i = int(np.argmax(probs))
-    return bundle.labels[i], float(probs[i])
-
-if uploaded_files:
-    cols = st.columns(min(3, len(uploaded_files)))
-    for idx, up in enumerate(uploaded_files):
-        file_bytes = np.frombuffer(up.read(), np.uint8)
-        bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        if bgr is None:
-            st.warning(f"Could not read image: {up.name}")
-            continue
-        label, score = predict_top1_from_bgr(bgr, bundle)
-        vis = draw_label_box(bgr.copy(), label, score, (10, 30))
-        st.session_state.setdefault("upload_preds", {})[up.name] = (label, score)
-        with cols[idx % len(cols)]:
-            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption=f"{up.name} → {label} ({score:.2f})", use_column_width=True)
-
-st.subheader("🎥 Live Webcam")
-webrtc_streamer(
-    key=f"webrtc-{selected_model}",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTC_CFG,
-    video_processor_factory=lambda: LiveVideoProcessor(bundle=bundle),
-    media_stream_constraints={"video": True, "audio": False},
-)
-
-st.caption("If the preview is black/frozen, refresh or toggle camera permissions. HTTPS is required for webcam.")
-
 
 class LiveVideoProcessor(VideoProcessorBase):
     def __init__(self, bundle: ModelBundle):
@@ -319,3 +279,14 @@ class LiveVideoProcessor(VideoProcessorBase):
             cv2.putText(img, f"Inference error: {str(e)[:60]}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+st.subheader("🎥 Live Webcam")
+webrtc_streamer(
+    key=f"webrtc-{selected_model}",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CFG,
+    video_processor_factory=lambda: LiveVideoProcessor(bundle=bundle),
+    media_stream_constraints={"video": True, "audio": False},
+)
+
+st.caption("If the preview is black/frozen, refresh or toggle camera permissions. HTTPS is required for webcam.")
